@@ -1,5 +1,15 @@
 # electric-sql
 
+## 0.10.2
+
+### Patch Changes
+
+- c35956d6: Don't leave a snapshot running when stopping the Satellite process
+- 22a7555a: Fix CLI `PROXY` option to correctly infer database name and not print introspection url.
+- ec27052c: Remove global `EventEmitter` and remove max listener warning.
+- 22a7555a: Fix `ELECTRIC_` options not working as CLI arguments
+- 244033ff: Ensure no snapshot is taken after closing the Satellite process.
+
 ## 0.10.1
 
 ### Patch Changes
