@@ -14,7 +14,7 @@ defmodule Satellite.TestWsClient do
   def connect(opts) do
     connection_opts =
       [
-        host: "127.0.0.1",
+        host: "localhost",
         port: 5133,
         protocol: :ws,
         path: "/ws",
@@ -157,6 +157,11 @@ defmodule Satellite.TestWsClient do
         Logger.error("Couldn't decode message from the server: #{inspect(reason)}")
         {:stop, {:error, reason}, {:close, 1007, ""}, state}
     end
+  end
+
+  @impl WebSocketClient
+  def handle_server_close(code, reason, state) do
+    send(state.opts.parent, {self(), :server_close, code, reason})
   end
 
   @impl GenServer

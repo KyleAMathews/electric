@@ -1,10 +1,13 @@
+import uniqWith from 'lodash.uniqwith'
+
 import {
-  ClientShapeDefinition,
+  Shape,
   ShapeDefinition,
   ShapeRequest,
   SubscriptionData,
   SubscriptionId,
 } from './types'
+import { QualifiedTablename } from '../../util'
 
 /**
  * Manages the state of satellite shape subscriptions
@@ -49,14 +52,16 @@ export interface SubscriptionsManager {
    * @param shapes Shapes for a potential request
    */
   getDuplicatingSubscription(
-    shapes: ClientShapeDefinition[]
+    shapes: Shape[]
   ): null | { inFlight: string } | { fulfilled: string }
 
   /**
-   * Deletes the subscription from the manager.
-   * @param subId the identifier of the subscription
+   * Deletes the subscription(s) from the manager.
+   * @param subId the identifier of the subscription or an array of subscription identifiers
    */
-  unsubscribe(subId: string): Promise<void>
+  unsubscribe(
+    subId: SubscriptionId | SubscriptionId[]
+  ): Promise<SubscriptionId[]>
 
   /**
    * Deletes all subscriptions from the manager. Useful to
@@ -76,4 +81,23 @@ export interface SubscriptionsManager {
    * loads the subscription manager state from a text representation
    */
   setState(serialized: string): void
+}
+
+/** List all tables covered by a given shape */
+export function getAllTablesForShape(
+  shape: Shape,
+  schema = 'main'
+): QualifiedTablename[] {
+  return uniqWith(doGetAllTablesForShape(shape, schema), (a, b) => a.isEqual(b))
+}
+
+function doGetAllTablesForShape(
+  shape: Shape,
+  schema: string
+): QualifiedTablename[] {
+  const includes =
+    shape.include?.flatMap((x) => doGetAllTablesForShape(x.select, schema)) ??
+    []
+  includes.push(new QualifiedTablename(schema, shape.tablename))
+  return includes
 }

@@ -5,22 +5,31 @@ defmodule Electric.Replication.Postgres.Client do
   Uses `:epgsql` for it's `start_replication` function. Note that epgsql
   doesn't support connecting via a unix socket.
   """
+
+  import Electric.Postgres.Dialect.Postgresql, only: [quote_ident: 1]
+
   alias Electric.Postgres.Extension
+  alias Electric.Postgres.Lsn
+  alias Electric.Replication.Connectors
+
   require Logger
 
   @type connection :: pid
   @type publication :: String.t()
 
-  @spec connect(:epgsql.connect_opts()) ::
+  @spec connect(Connectors.connection_opts()) ::
           {:ok, connection :: pid()} | {:error, reason :: :epgsql.connect_error()}
-  def connect(%{} = config) do
-    config
-    |> Electric.Utils.epgsql_config()
-    |> :epgsql.connect()
+  def connect(conn_opts) do
+    Logger.debug("#{inspect(__MODULE__)}.connect(#{inspect(sanitize_conn_opts(conn_opts))})")
+
+    {%{ip_addr: ip_addr}, %{username: username, password: password} = epgsql_conn_opts} =
+      Connectors.pop_extraneous_conn_opts(conn_opts)
+
+    :epgsql.connect(ip_addr, username, password, epgsql_conn_opts)
   end
 
-  @spec with_conn(:epgsql.connect_opts(), fun()) :: term() | {:error, term()}
-  def with_conn(%{host: host, username: username, password: password} = config, fun) do
+  @spec with_conn(Connectors.connection_opts(), fun()) :: term() | {:error, term()}
+  def with_conn(conn_opts, fun) do
     # Best effort capture exit message, expect trap_exit to be set
     wait_exit = fn conn, res ->
       receive do
@@ -30,11 +39,14 @@ defmodule Electric.Replication.Postgres.Client do
       end
     end
 
-    Logger.info("connect: #{inspect(Map.drop(config, [:password]))}")
+    Logger.info("#{inspect(__MODULE__)}.with_conn(#{inspect(sanitize_conn_opts(conn_opts))})")
 
     {:ok, conn} = :epgsql_sock.start_link()
 
-    case :epgsql.connect(conn, host, username, password, Electric.Utils.epgsql_config(config)) do
+    {%{ip_addr: ip_addr}, %{username: username, password: password} = epgsql_conn_opts} =
+      Connectors.pop_extraneous_conn_opts(conn_opts)
+
+    case :epgsql.connect(conn, ip_addr, username, password, epgsql_conn_opts) do
       {:ok, ^conn} ->
         try do
           fun.(conn)
@@ -54,6 +66,28 @@ defmodule Electric.Replication.Postgres.Client do
   end
 
   @doc """
+  Format the connection opts for output, hiding the password, etc.
+  """
+  def sanitize_conn_opts(conn_opts) do
+    conn_opts
+    |> Map.put(:password, ~c"******")
+    |> Map.update!(:ip_addr, &:inet.ntoa/1)
+    |> truncate_cacerts()
+  end
+
+  defp truncate_cacerts(%{ssl_opts: ssl_opts} = conn_opts) do
+    ssl_opts =
+      case ssl_opts[:cacerts] do
+        nil -> ssl_opts
+        list -> Keyword.put(ssl_opts, :cacerts, "[...](#{length(list)})")
+      end
+
+    %{conn_opts | ssl_opts: ssl_opts}
+  end
+
+  defp truncate_cacerts(conn_opts), do: conn_opts
+
+  @doc """
   Wrapper for :epgsql.with_transaction/3 that always sets `reraise` to `true` by default and makes `begin_opts` a
   standalone function argument for easier code reading.
   """
@@ -68,15 +102,28 @@ defmodule Electric.Replication.Postgres.Client do
   end
 
   @types_query """
-  SELECT nspname, typname, pg_type.oid, typarray, typelem, typlen, typtype, typbasetype, typrelid, EXISTS(SELECT 1 FROM pg_type as t WHERE pg_type.oid = t.typarray) as is_array
-  FROM pg_type
-  JOIN pg_namespace ON typnamespace = pg_namespace.oid
-  WHERE typtype != 'c'
-  ORDER BY oid
+    SELECT
+      nspname,
+      typname,
+      t.oid,
+      typarray,
+      typelem,
+      typlen,
+      typtype::text
+    FROM
+      pg_type t
+    JOIN
+      pg_namespace ON pg_namespace.oid = typnamespace
+    WHERE
+      typtype = ANY($1::char[])
+      AND nspname IN ('pg_catalog', 'electric', 'public')
+    ORDER BY
+      t.oid
   """
 
-  def query_oids(conn) do
-    {:ok, _, type_data} = squery(conn, @types_query)
+  def query_oids(conn, kinds \\ [:BASE, :DOMAIN, :ENUM]) do
+    typtypes = Enum.map(kinds, &Electric.Postgres.OidDatabase.PgType.encode_kind/1)
+    {:ok, _, type_data} = :epgsql.equery(conn, @types_query, [typtypes])
     {:ok, type_data}
   end
 
@@ -93,8 +140,7 @@ defmodule Electric.Replication.Postgres.Client do
 
   @spec stop_subscription(connection, String.t()) :: :ok
   def stop_subscription(conn, name) do
-    with {:ok, _, _} <- squery(conn, ~s|ALTER SUBSCRIPTION "#{name}"
-            DISABLE|) do
+    with {:ok, _, _} <- squery(conn, ~s|ALTER SUBSCRIPTION "#{name}" DISABLE|) do
       :ok
     end
   end
@@ -110,15 +156,78 @@ defmodule Electric.Replication.Postgres.Client do
     {:ok, system_id}
   end
 
-  @spec create_slot(connection(), String.t()) :: {:ok, String.t()}
-  def create_slot(conn, slot_name) do
+  @doc """
+  Create the main replication slot to maintain a resumable window of WAL records in Postgres.
+
+  This slot should be used as a source for pg_copy_logical_replication() to create a new,
+  temporary replication slot for the replication connection.
+
+  Note that unless manually moved forward with pg_replication_slot_advance(), it will prevent
+  Postgres from discarding old WAL records, leading to unbounded disk usage growth.
+  """
+  @spec create_main_slot(connection(), String.t()) :: {:ok, String.t()}
+  def create_main_slot(conn, slot_name) do
     case squery(
            conn,
            ~s|CREATE_REPLICATION_SLOT "#{slot_name}" LOGICAL pgoutput NOEXPORT_SNAPSHOT|
          ) do
-      {:ok, _, _} -> {:ok, slot_name}
+      {:ok, _, _} ->
+        {:ok, slot_name}
+
       # TODO: Verify that the subscription references the correct publication
-      {:error, {_, _, _, :duplicate_object, _, _}} -> {:ok, slot_name}
+      {:error, {:error, :error, _pg_error_code, :duplicate_object, _, _}} ->
+        {:ok, slot_name}
+
+      {:error,
+       {:error, :error, "55000", :object_not_in_prerequisite_state,
+        "logical decoding requires wal_level >= logical", _c_stacktrace}} ->
+        {:error, :wal_level_not_logical}
+
+      {:error,
+       {:error, :error, "42601", :syntax_error,
+        "syntax error at or near \"CREATE_REPLICATION_SLOT\"" = msg, _c_stacktrace}} ->
+        {:error, {:create_replication_slot_syntax_error, msg}}
+    end
+  end
+
+  def create_publication(conn, name, []) do
+    create_publication(conn, name, "")
+  end
+
+  def create_publication(conn, name, tables) when is_list(tables) do
+    table_list =
+      tables
+      |> Enum.map(&quote_ident/1)
+      |> Enum.join(", ")
+
+    create_publication(conn, name, "FOR TABLE #{table_list}")
+  end
+
+  def create_publication(conn, name, table_spec) when is_binary(table_spec) do
+    case squery(conn, ~s|CREATE PUBLICATION "#{name}" #{table_spec}|) do
+      {:ok, _, _} -> {:ok, name}
+      # TODO: Verify that the publication has the correct tables
+      {:error, {_, _, _, :duplicate_object, _, _}} -> {:ok, name}
+    end
+  end
+
+  @doc """
+  Create a temporary slot as a copy of the main one.
+
+  Its lsn matches that of the main slot at the time of the copy. This temporary slot should be
+  used for starting a new replication connection, at which point a later lsn can be specified
+  as a starting point for the replication stream.
+
+  Postgres will automatically delete the temporary slot when the connection that created it closes.
+  """
+  @spec create_temporary_slot(connection(), String.t(), String.t()) ::
+          {:ok, String.t(), Lsn.t()} | {:error, term}
+  def create_temporary_slot(conn, source_slot_name, tmp_slot_name) do
+    sql =
+      "SELECT * FROM pg_copy_logical_replication_slot('#{source_slot_name}', '#{tmp_slot_name}', true)"
+
+    with {:ok, _, [{^tmp_slot_name, lsn_str}]} <- squery(conn, sql) do
+      {:ok, tmp_slot_name, Lsn.from_string(lsn_str)}
     end
   end
 
@@ -136,21 +245,21 @@ defmodule Electric.Replication.Postgres.Client do
   end
 
   @doc """
-  Start consuming logical replication feed using a given `publication` and `slot`.
+  Start consuming the logical replication stream using given `publication` and `slot`.
 
-  The handler can be a pid or a module implementing the `handle_x_log_data` callback.
-
-  Returns `:ok` on success.
+  The handler can be a pid or a module implementing epgsql's `handle_x_log_data` callback.
   """
-  def start_replication(conn, publication, slot, handler) do
+  @spec start_replication(connection, String.t(), String.t(), Lsn.t(), module | pid) ::
+          :ok | {:error, term}
+  def start_replication(conn, publication, slot, lsn, handler) do
     Logger.debug(
       "#{__MODULE__} start_replication: slot: '#{slot}', publication: '#{publication}'"
     )
 
+    slot = to_charlist(slot)
+    lsn = to_charlist(lsn)
     opts = ~c"proto_version '1', publication_names '#{publication}', messages"
-
-    conn
-    |> :epgsql.start_replication(:erlang.binary_to_list(slot), handler, [], ~c"0/0", opts)
+    :epgsql.start_replication(conn, slot, handler, [], lsn, opts)
   end
 
   @doc """
@@ -186,10 +295,32 @@ defmodule Electric.Replication.Postgres.Client do
 
   Returns `:ok` on success.
   """
-  def acknowledge_lsn(conn, %{segment: segment, offset: offset}) do
-    <<decimal_lsn::integer-64>> = <<segment::integer-32, offset::integer-32>>
+  def acknowledge_lsn(conn, lsn) do
+    wal_offset = Lsn.to_integer(lsn)
+    :epgsql.standby_status_update(conn, wal_offset, wal_offset)
+  end
 
-    :epgsql.standby_status_update(conn, decimal_lsn, decimal_lsn)
+  @doc """
+  Fetch the current lsn from Postgres.
+  """
+  @spec current_lsn(connection) :: {:ok, Lsn.t()} | {:error, term}
+  def current_lsn(conn) do
+    with {:ok, _, [{lsn_str}]} <- squery(conn, "SELECT pg_current_wal_lsn()") do
+      {:ok, Lsn.from_string(lsn_str)}
+    end
+  end
+
+  @doc """
+  Advance the earliest accessible lsn of the given slot to `to_lsn`.
+
+  After a slot is advanced there is no way for it to be rewound back to an earlier lsn.
+  """
+  @spec advance_replication_slot(connection, String.t(), Lsn.t()) :: :ok | {:error, term}
+  def advance_replication_slot(conn, slot_name, to_lsn) do
+    with {:ok, _, _} <-
+           squery(conn, "SELECT pg_replication_slot_advance('#{slot_name}', '#{to_lsn}')") do
+      :ok
+    end
   end
 
   @relkind %{table: ["r"], index: ["i"], view: ["v", "m"]}

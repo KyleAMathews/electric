@@ -1,6 +1,12 @@
 import { AuthState } from '../auth/index'
 import { QualifiedTablename } from '../util/tablename'
-import { ConnectivityState, DbName, RowId } from '../util/types'
+import {
+  ConnectivityState,
+  DbName,
+  RowId,
+  DataChangeType,
+  Record,
+} from '../util/types'
 
 export { EventNotifier } from './event'
 export { MockNotifier } from './mock'
@@ -9,13 +15,20 @@ export interface AuthStateNotification {
   authState: AuthState
 }
 
+export type RecordChange = {
+  primaryKey: Record
+  type: `${DataChangeType}` | 'INITIAL'
+}
 export interface Change {
   qualifiedTablename: QualifiedTablename
-  rowids?: RowId[]
+  rowids?: RowId[] // rowid of each oplog entry for the changes - availiable only for local changes
+  recordChanges?: RecordChange[]
 }
+export type ChangeOrigin = 'local' | 'remote' | 'initial'
 export interface ChangeNotification {
   dbName: DbName
   changes: Change[]
+  origin: ChangeOrigin
 }
 export interface PotentialChangeNotification {
   dbName: DbName
@@ -46,6 +59,8 @@ export type NotificationCallback =
   | ChangeCallback
   | PotentialChangeCallback
   | ConnectivityStateChangeCallback
+
+export type UnsubscribeFunction = () => void
 
 export interface Notifier {
   // The name of the primary database that components communicating via this
@@ -78,8 +93,7 @@ export interface Notifier {
   // Calling `authStateChanged` notifies the Satellite process that the
   // user's authentication credentials have changed.
   authStateChanged(authState: AuthState): void
-  subscribeToAuthStateChanges(callback: AuthStateCallback): string
-  unsubscribeFromAuthStateChanges(key: string): void
+  subscribeToAuthStateChanges(callback: AuthStateCallback): UnsubscribeFunction
 
   // The data change notification workflow starts by the electric database
   // clients (or the user manually) calling `potentiallyChanged` whenever
@@ -90,32 +104,29 @@ export interface Notifier {
   // Satellite processes subscribe to these "data has potentially changed"
   // notifications. When they get one, they check the `_oplog` table in the
   // database for *actual* changes persisted by the triggers.
-  subscribeToPotentialDataChanges(callback: PotentialChangeCallback): string
-  unsubscribeFromPotentialDataChanges(key: string): void
+  subscribeToPotentialDataChanges(
+    callback: PotentialChangeCallback
+  ): UnsubscribeFunction
 
   // When Satellite detects actual data changes in the oplog for a given
   // database, it replicates it and calls  `actuallyChanged` with the list
   // of changes.
-  actuallyChanged(dbName: DbName, changes: Change[]): void
+  actuallyChanged(dbName: DbName, changes: Change[], origin: ChangeOrigin): void
 
   // Reactive hooks then subscribe to "data has actually changed" notifications,
   // using the info to trigger re-queries, if the changes affect databases and
   // tables that their queries depend on. This then trigger re-rendering if
   // the query results are actually affected by the data changes.
-  subscribeToDataChanges(callback: ChangeCallback): string
-  unsubscribeFromDataChanges(key: string): void
+  subscribeToDataChanges(callback: ChangeCallback): UnsubscribeFunction
 
   // Notification for network connectivity state changes.
-  // A connectivity change s can be triggered manually,
-  // or automatically in consequence of internal client events.
-  // 'available': network is, or has become, available
+  // A connectivity change is automatically triggered in consequence of internal client events.
   // 'connected': connection to Electric established
-  // 'disconnected': Electric is unreachable, or network is unavailable
-  // 'error': disconnected with an error (TODO: add error info)
+  // 'disconnected': Electric is unreachable, or network is unavailable.
+  //                 A reason for the disconnection can be provided.
   connectivityStateChanged(dbName: string, state: ConnectivityState): void
 
   subscribeToConnectivityStateChanges(
     callback: ConnectivityStateChangeCallback
-  ): string
-  unsubscribeFromConnectivityStateChanges(key: string): void
+  ): UnsubscribeFunction
 }

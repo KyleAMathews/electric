@@ -3,10 +3,12 @@ import { ConnectivityStateChangeNotification } from '../../src/notifiers'
 
 import { EventNotifier } from '../../src/notifiers/event'
 import { QualifiedTablename } from '../../src/util/tablename'
+import EventEmitter from 'events'
 
 test('subscribe to potential data changes', async (t) => {
-  const source = new EventNotifier('test.db')
-  const target = new EventNotifier('test.db')
+  const eventEmitter = new EventEmitter()
+  const source = new EventNotifier('test.db', eventEmitter)
+  const target = new EventNotifier('test.db', eventEmitter)
 
   const notifications = []
 
@@ -20,9 +22,10 @@ test('subscribe to potential data changes', async (t) => {
 })
 
 test('potential data change subscriptions are scoped by dbName(s)', async (t) => {
-  const source = new EventNotifier('foo.db')
-  const t1 = new EventNotifier('foo.db')
-  const t2 = new EventNotifier('bar.db')
+  const eventEmitter = new EventEmitter()
+  const source = new EventNotifier('foo.db', eventEmitter)
+  const t1 = new EventNotifier('foo.db', eventEmitter)
+  const t2 = new EventNotifier('bar.db', eventEmitter)
 
   const notifications = []
 
@@ -44,8 +47,9 @@ test('potential data change subscriptions are scoped by dbName(s)', async (t) =>
 })
 
 test('subscribe to actual data changes', async (t) => {
-  const source = new EventNotifier('test.db')
-  const target = new EventNotifier('test.db')
+  const eventEmitter = new EventEmitter()
+  const source = new EventNotifier('test.db', eventEmitter)
+  const target = new EventNotifier('test.db', eventEmitter)
 
   const notifications = []
 
@@ -55,15 +59,16 @@ test('subscribe to actual data changes', async (t) => {
 
   const qualifiedTablename = new QualifiedTablename('main', 'Items')
 
-  source.actuallyChanged('test.db', [{ qualifiedTablename }])
+  source.actuallyChanged('test.db', [{ qualifiedTablename }], 'local')
 
   t.is(notifications.length, 1)
 })
 
 test('actual data change subscriptions are scoped by dbName', async (t) => {
-  const source = new EventNotifier('foo.db')
-  const t1 = new EventNotifier('foo.db')
-  const t2 = new EventNotifier('bar.db')
+  const eventEmitter = new EventEmitter()
+  const source = new EventNotifier('foo.db', eventEmitter)
+  const t1 = new EventNotifier('foo.db', eventEmitter)
+  const t2 = new EventNotifier('bar.db', eventEmitter)
 
   const notifications = []
 
@@ -77,27 +82,28 @@ test('actual data change subscriptions are scoped by dbName', async (t) => {
   const qualifiedTablename = new QualifiedTablename('main', 'Items')
   const changes = [{ qualifiedTablename }]
 
-  source.actuallyChanged('foo.db', changes)
+  source.actuallyChanged('foo.db', changes, 'local')
   t.is(notifications.length, 1)
 
-  source.actuallyChanged('lala.db', changes)
+  source.actuallyChanged('lala.db', changes, 'local')
   t.is(notifications.length, 1)
 
-  source.actuallyChanged('bar.db', changes)
+  source.actuallyChanged('bar.db', changes, 'local')
   t.is(notifications.length, 1)
 
   source.attach('bar.db', 'bar.db')
-  source.actuallyChanged('bar.db', changes)
+  source.actuallyChanged('bar.db', changes, 'local')
   t.is(notifications.length, 2)
 
   t2.attach('foo.db', 'foo.db')
-  source.actuallyChanged('foo.db', changes)
+  source.actuallyChanged('foo.db', changes, 'local')
   t.is(notifications.length, 4)
 })
 
 test('subscribe to connectivity change events is scoped by dbName', async (t) => {
-  const source = new EventNotifier('test.db')
-  const target = new EventNotifier('test.db')
+  const eventEmitter = new EventEmitter()
+  const source = new EventNotifier('test.db', eventEmitter)
+  const target = new EventNotifier('test.db', eventEmitter)
 
   const notifications: ConnectivityStateChangeNotification[] = []
 
@@ -105,30 +111,44 @@ test('subscribe to connectivity change events is scoped by dbName', async (t) =>
     notifications.push(x)
   })
 
-  source.connectivityStateChanged('test.db', 'connected')
+  source.connectivityStateChanged('test.db', { status: 'connected' })
 
   t.is(notifications.length, 1)
 
-  source.connectivityStateChanged('non-existing-db', 'connected')
+  source.connectivityStateChanged('non-existing-db', { status: 'connected' })
 
   t.is(notifications.length, 1)
 })
 
 test('no more connectivity events after unsubscribe', async (t) => {
-  const source = new EventNotifier('test.db')
-  const target = new EventNotifier('test.db')
+  const eventEmitter = new EventEmitter()
+  const source = new EventNotifier('test.db', eventEmitter)
+  const target = new EventNotifier('test.db', eventEmitter)
 
   const notifications: ConnectivityStateChangeNotification[] = []
 
-  const key = target.subscribeToConnectivityStateChanges((x) => {
+  const unsubscribe = target.subscribeToConnectivityStateChanges((x) => {
     notifications.push(x)
   })
 
-  source.connectivityStateChanged('test.db', 'connected')
+  source.connectivityStateChanged('test.db', { status: 'connected' })
 
-  target.unsubscribeFromConnectivityStateChanges(key)
+  unsubscribe()
 
-  source.connectivityStateChanged('test.db', 'connected')
+  source.connectivityStateChanged('test.db', { status: 'connected' })
 
   t.is(notifications.length, 1)
+})
+
+test('empty changes should not emit', async (t) => {
+  const source = new EventNotifier('foo.db')
+
+  const notifications = []
+
+  source.subscribeToDataChanges((x) => {
+    notifications.push(x)
+  })
+
+  source.actuallyChanged('foo.db', [], 'local')
+  t.is(notifications.length, 0)
 })

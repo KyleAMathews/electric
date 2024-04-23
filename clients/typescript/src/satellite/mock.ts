@@ -1,4 +1,4 @@
-import { AuthConfig, AuthState } from '../auth/index'
+import { AuthState } from '../auth/index'
 import { DatabaseAdapter } from '../electric/adapter'
 import { Migrator } from '../migrators/index'
 import { Notifier } from '../notifiers/index'
@@ -17,19 +17,30 @@ import {
   StopReplicationResponse,
   OutboundStartedCallback,
   TransactionCallback,
+  SocketCloseReason,
+  ReplicationStatus,
+  AdditionalDataCallback,
+  ConnectivityState,
+  ReplicatedRowTransformer,
 } from '../util/types'
 import { ElectricConfig } from '../config/index'
 
-import { Client, ConnectionWrapper, Satellite } from './index'
+import { Client, Satellite } from './index'
 import { SatelliteOpts, SatelliteOverrides, satelliteDefaults } from './config'
 import { BaseRegistry } from './registry'
 import { SocketFactory } from '../sockets'
-import { EventEmitter } from 'events'
-import { DEFAULT_LOG_POS, subsDataErrorToSatelliteError, base64 } from '../util'
-import { bytesToNumber, uuid } from '../util/common'
+import {
+  DEFAULT_LOG_POS,
+  subsDataErrorToSatelliteError,
+  base64,
+  AsyncEventEmitter,
+  genUUID,
+  QualifiedTablename,
+} from '../util'
+import { bytesToNumber } from '../util/common'
 import { generateTag } from './oplog'
 import {
-  ClientShapeDefinition,
+  Shape,
   InitialDataChange,
   SUBSCRIPTION_DELIVERED,
   SUBSCRIPTION_ERROR,
@@ -48,6 +59,7 @@ import {
 } from '../_generated/protocol/satellite'
 import { ShapeSubscription } from './process'
 import { DbSchema } from '../client/model/schema'
+import { getAllTablesForShape } from './shapes'
 
 export const MOCK_BEHIND_WINDOW_LSN = 42
 export const MOCK_INTERNAL_ERROR = 27
@@ -59,6 +71,7 @@ export class MockSatelliteProcess implements Satellite {
   notifier: Notifier
   socketFactory: SocketFactory
   opts: SatelliteOpts
+  token: string | undefined
 
   constructor(
     dbName: DbName,
@@ -75,9 +88,8 @@ export class MockSatelliteProcess implements Satellite {
     this.socketFactory = socketFactory
     this.opts = opts
   }
-  subscribe(
-    _shapeDefinitions: ClientShapeDefinition[]
-  ): Promise<ShapeSubscription> {
+  connectivityState?: ConnectivityState | undefined
+  subscribe(_shapeDefinitions: Shape[]): Promise<ShapeSubscription> {
     return Promise.resolve({
       synced: Promise.resolve(),
     })
@@ -87,16 +99,43 @@ export class MockSatelliteProcess implements Satellite {
     throw new Error('Method not implemented.')
   }
 
-  async start(_authConfig: AuthConfig): Promise<ConnectionWrapper> {
+  async start(): Promise<void> {
     await sleepAsync(50)
-    return {
-      connectionPromise: new Promise((resolve) => resolve()),
-    }
+  }
+
+  setToken(token: string): void {
+    this.token = token
+  }
+
+  hasToken() {
+    return this.token !== undefined
+  }
+
+  async connect(): Promise<void> {
+    await sleepAsync(50)
+  }
+
+  async connectWithBackoff(): Promise<void> {
+    await this.connect()
+  }
+
+  disconnect(): void {}
+  clientDisconnect(): void {}
+
+  authenticate(_token: string): Promise<void> {
+    return Promise.resolve()
   }
 
   async stop(): Promise<void> {
     await sleepAsync(50)
   }
+
+  setReplicationTransform(
+    _tableName: QualifiedTablename,
+    _transform: ReplicatedRowTransformer<DataRecord>
+  ): void {}
+
+  clearReplicationTransform(_tableName: QualifiedTablename): void {}
 }
 
 export class MockRegistry extends BaseRegistry {
@@ -113,7 +152,7 @@ export class MockRegistry extends BaseRegistry {
     migrator: Migrator,
     notifier: Notifier,
     socketFactory: SocketFactory,
-    config: ElectricConfig,
+    _config: ElectricConfig,
     overrides?: SatelliteOverrides
   ): Promise<Satellite> {
     if (this.shouldFailToStart) {
@@ -130,19 +169,29 @@ export class MockRegistry extends BaseRegistry {
       socketFactory,
       opts
     )
-    await satellite.start(config.auth)
+    await satellite.start()
 
     return satellite
   }
 }
 
-export class MockSatelliteClient extends EventEmitter implements Client {
+type Events = {
+  [SUBSCRIPTION_DELIVERED]: (data: SubscriptionData) => void
+  [SUBSCRIPTION_ERROR]: (error: SatelliteError, subscriptionId: string) => void
+  outbound_started: OutboundStartedCallback
+  error: (error: SatelliteError) => void
+}
+export class MockSatelliteClient
+  extends AsyncEventEmitter<Events>
+  implements Client
+{
   isDown = false
   replicating = false
   disconnected = true
   inboundAck: Uint8Array = DEFAULT_LOG_POS
 
   outboundSent: Uint8Array = DEFAULT_LOG_POS
+  outboundTransactionsEnqueued: DataTransaction[] = []
 
   // to clear any pending timeouts
   timeouts: NodeJS.Timeout[] = []
@@ -150,8 +199,17 @@ export class MockSatelliteClient extends EventEmitter implements Client {
   relations: RelationsCache = {}
   relationsCb?: (relation: Relation) => void
   transactionsCb?: TransactionCallback
+  additionalDataCb?: AdditionalDataCallback
 
   relationData: Record<string, DataRecord[]> = {}
+
+  deliverFirst = false
+
+  private startReplicationDelayMs: number | null = null
+
+  setStartReplicationDelayMs(delayMs: number | null) {
+    this.startReplicationDelayMs = delayMs
+  }
 
   setRelations(relations: RelationsCache): void {
     this.relations = relations
@@ -169,6 +227,10 @@ export class MockSatelliteClient extends EventEmitter implements Client {
     data.push(record)
   }
 
+  enableDeliverFirst() {
+    this.deliverFirst = true
+  }
+
   subscribe(
     subscriptionId: string,
     shapes: ShapeRequest[]
@@ -177,7 +239,8 @@ export class MockSatelliteClient extends EventEmitter implements Client {
     const shapeReqToUuid: Record<string, string> = {}
 
     for (const shape of shapes) {
-      for (const { tablename } of shape.definition.selects) {
+      const tables = getAllTablesForShape(shape.definition, 'main')
+      for (const { tablename } of tables) {
         if (tablename === 'failure' || tablename === 'Items') {
           return Promise.resolve({
             subscriptionId,
@@ -192,7 +255,7 @@ export class MockSatelliteClient extends EventEmitter implements Client {
             })
           })
         } else {
-          shapeReqToUuid[shape.requestId] = uuid()
+          shapeReqToUuid[shape.requestId] = genUUID()
           const records: DataRecord[] = this.relationData[tablename] ?? []
 
           for (const record of records) {
@@ -208,18 +271,31 @@ export class MockSatelliteClient extends EventEmitter implements Client {
     }
 
     return new Promise((resolve) => {
-      setTimeout(() => {
-        this.emit(SUBSCRIPTION_DELIVERED, {
+      const emit = () => {
+        this.enqueueEmit(SUBSCRIPTION_DELIVERED, {
           subscriptionId,
           lsn: base64.toBytes('MTIz'), // base64.encode("123")
           data,
           shapeReqToUuid,
         } as SubscriptionData)
-      }, 1)
+      }
 
-      resolve({
-        subscriptionId,
-      })
+      const resolveProm = () => {
+        resolve({
+          subscriptionId,
+        })
+      }
+
+      if (this.deliverFirst) {
+        // When the `deliverFirst` flag is set,
+        // we deliver the subscription before resolving the promise.
+        emit()
+        setTimeout(resolveProm, 1)
+      } else {
+        // Otherwise, we resolve the promise before delivering the subscription.
+        setTimeout(emit, 1)
+        resolveProm()
+      }
     })
   }
 
@@ -243,16 +319,26 @@ export class MockSatelliteClient extends EventEmitter implements Client {
     this.removeListener(SUBSCRIPTION_ERROR, errorCallback)
   }
 
-  subscribeToError(cb: ErrorCallback): void {
+  subscribeToError(cb: (error: SatelliteError) => void): void {
     this.on('error', cb)
   }
 
-  unsubscribeToError(cb: ErrorCallback): void {
+  emitSocketClosedError(ev: SocketCloseReason): void {
+    this.enqueueEmit('error', new SatelliteError(ev, 'socket closed'))
+  }
+
+  unsubscribeToError(cb: (error: SatelliteError) => void): void {
     this.removeListener('error', cb)
   }
 
   isConnected(): boolean {
     return !this.disconnected
+  }
+
+  getOutboundReplicationStatus(): ReplicationStatus {
+    return this.isConnected() && this.replicating
+      ? ReplicationStatus.ACTIVE
+      : ReplicationStatus.STOPPED
   }
 
   shutdown(): void {
@@ -280,29 +366,33 @@ export class MockSatelliteClient extends EventEmitter implements Client {
   authenticate(_authState: AuthState): Promise<AuthResponse> {
     return Promise.resolve({})
   }
-  startReplication(lsn: LSN): Promise<StartReplicationResponse> {
+  async startReplication(lsn: LSN): Promise<StartReplicationResponse> {
+    if (this.startReplicationDelayMs) {
+      await sleepAsync(this.startReplicationDelayMs)
+    }
+
     this.replicating = true
     this.inboundAck = lsn
 
-    const t = setTimeout(() => this.emit('outbound_started'), 100)
+    const t = setTimeout(() => this.enqueueEmit('outbound_started'), 100)
     this.timeouts.push(t)
 
     if (lsn && bytesToNumber(lsn) == MOCK_BEHIND_WINDOW_LSN) {
-      return Promise.resolve({
+      return {
         error: new SatelliteError(
           SatelliteErrorCode.BEHIND_WINDOW,
           'MOCK BEHIND_WINDOW_LSN ERROR'
         ),
-      })
+      }
     }
 
     if (lsn && bytesToNumber(lsn) == MOCK_INTERNAL_ERROR) {
-      return Promise.resolve({
+      return {
         error: new SatelliteError(
           SatelliteErrorCode.INTERNAL,
           'MOCK INTERNAL_ERROR'
         ),
-      })
+      }
     }
 
     return Promise.resolve({})
@@ -329,7 +419,23 @@ export class MockSatelliteClient extends EventEmitter implements Client {
     throw new Error('Method not implemented.')
   }
 
+  subscribeToAdditionalData(callback: AdditionalDataCallback): void {
+    this.additionalDataCb = callback
+  }
+
+  unsubscribeToAdditionalData(_cb: AdditionalDataCallback): void {
+    throw new Error('Method not implemented.')
+  }
+
   enqueueTransaction(transaction: DataTransaction): void {
+    if (!this.replicating) {
+      throw new SatelliteError(
+        SatelliteErrorCode.REPLICATION_NOT_STARTED,
+        'enqueuing a transaction while outbound replication has not started'
+      )
+    }
+
+    this.outboundTransactionsEnqueued.push(transaction)
     this.outboundSent = transaction.lsn
   }
 
@@ -357,7 +463,17 @@ export class MockSatelliteClient extends EventEmitter implements Client {
       })
 
       const satError = subsDataErrorToSatelliteError(satSubsError)
-      this.emit(SUBSCRIPTION_ERROR, satError, subscriptionId)
+      this.enqueueEmit(SUBSCRIPTION_ERROR, satError, subscriptionId)
     }, timeout)
+  }
+
+  setReplicationTransform(
+    _tableName: QualifiedTablename,
+    _transform: ReplicatedRowTransformer<DataRecord>
+  ): void {
+    throw new Error('Method not implemented.')
+  }
+  clearReplicationTransform(_tableName: QualifiedTablename): void {
+    throw new Error('Method not implemented.')
   }
 }

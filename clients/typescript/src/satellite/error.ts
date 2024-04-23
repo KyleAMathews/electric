@@ -7,12 +7,15 @@ const fatalErrorDescription =
 const throwErrors = [
   SatelliteErrorCode.INTERNAL,
   SatelliteErrorCode.FATAL_ERROR,
+  SatelliteErrorCode.CONNECTION_CANCELLED_BY_DISCONNECT,
+  SatelliteErrorCode.REPLICATION_TRANSFORM_ERROR,
 ]
 
 const fatalErrors = [
   SatelliteErrorCode.INVALID_REQUEST,
   SatelliteErrorCode.UNKNOWN_SCHEMA_VSN,
   SatelliteErrorCode.AUTH_REQUIRED,
+  SatelliteErrorCode.AUTH_EXPIRED,
 ]
 
 const outOfSyncErrors = [

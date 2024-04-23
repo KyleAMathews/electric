@@ -6,7 +6,7 @@ description: >-
 
 ElectricSQL is in <strong className="warning-color">public alpha</strong> phase.
 
-APIs are not guaranteed to be stable. Backwards incompatible changes may (and will) be introduced in both minor and major version releases.
+APIs are not guaranteed to be stable. Backwards incompatible changes may (and will) be introduced in patch, minor and major version releases.
 
 ## Practical limitations
 
@@ -14,7 +14,7 @@ Key aspects of the system are not fully implemented yet:
 
 1. [Data modelling](#data-modelling) &mdash; remove constraints and ensure migrations are additive
 2. [DDLX rules](#ddlx-rules) &mdash; limited to electrification
-3. [Shapes](#shapes) &mdash; currently limited to whole table sync
+3. [Shapes](#shapes) &mdash; support following relations and partial sync, but with some limitations
 
 Plus you may encounter [failure modes](#failure-modes) that you need to work around in development
 
@@ -40,21 +40,23 @@ The DDLX rules for permissions, roles, validation or local SQLite commands docum
 ALTER TABLE items ENABLE ELECTRIC;
 ```
 
-### Shapes
-
-[Shape-based sync](../usage/data-access/shapes.md) using the [`sync()` function](../api/clients/typescript.md#sync) currently supports whole table sync. If the table contains outgoing foreign keys, then all tables that can be transitively reached by following these foreign keys must be part of the shape. There is no support for `where` clauses to filter the initial target rows or `select` clauses to filter the include tree. As a result, current calls to `db.tablename.sync({...})` will "over sync" additional data onto the device.
-
 :::note
-There is one temporary feature to filter data onto the local device: set an `electric_user_id` field on your table. If you do, then rows will only be synced if the value of that column matches the value of the authenticated user_id provided in your [auth token](../usage/auth/index.md).
+There is one temporary feature to limit data that goes on the local device: set an `electric_user_id` field on your table. If you do, then rows will only be synced if the value of that column matches the value of the authenticated user_id provided in your [auth token](../usage/auth/index.md).
+
+If you're OK with just filtering the available data, you should use [filter clauses on shapes](../usage/data-access/shapes.md#filter-clauses).
 
 This is a very temporary workaround and will be removed soon!
 :::
+
+### Shapes
+
+[Shape-based sync](../usage/data-access/shapes.md) using the [`sync()` function](../api/clients/typescript.md#sync) is currently supported with some [limitations](../usage/data-access/shapes.md#limitations-and-issues). You can ask for specific tables and rows, filter them, and follow relations. The biggest current limitation is that you cannot unsubscribe from a shape.
 
 ### Failure modes
 
 Currently, you may experience bugs or behaviour that leads to an inconsistent data state. This is **not** related to the core [consistency model](./consistency.md). It's a consequence of the lack of validation and some recovery modes still pending implementation.
 
-In development, you can usually recover from these bugs by resetting your database(s). In the browser, if you clear localStorage and IndexedDB (for example in Chrome, "Inspect" to open the developer tools -> Application -> Storage -> Clear site data) that will reset the client and your local app will re-sync from the server.
+In development, you can usually recover from these bugs by resetting your database(s). In the browser, if you clear localStorage and IndexedDB (for example, in Chrome, "Inspect" to open the developer tools -> Application -> Storage -> Clear site data) that will reset the client and your local app will re-sync from the server.
 
 If you need to re-set your Postgres database, if you're using Docker Compose (such as with the starter template or examples) you can usually use something like `yarn backend:down` or `docker compose -f backend/compose.yaml down --volumes`. Alternatively, if you can't just nuke your whole database folder, you'll need to manually drop the objects created by Electric:
 

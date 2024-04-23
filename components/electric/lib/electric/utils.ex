@@ -4,6 +4,37 @@ defmodule Electric.Utils do
   """
 
   @doc """
+  Get a hash of an arbitrary Elixir term in a predictable form, encoded as base64 string
+  """
+  @spec term_hash(term()) :: binary()
+  def term_hash(term),
+    do: Base.encode64(:crypto.hash(:blake2b, :erlang.term_to_iovec(term, [:deterministic])))
+
+  @doc """
+  Merge two graphs by merging their edges together.
+
+  This does not copy over unconnected nodes, because for current use-cases we only care about edges or connected nodes.
+  Implementation of graph edge search is adapted from `Graph.edges/1`, but optimized to (1) be a direct reduction and (2) not create
+  `Graph.Edge` structs since it will be immediately torn down when merging.
+  """
+  def merge_graph_edges(%Graph{} = g1, %Graph{out_edges: edges, edges: meta, vertices: vs}) do
+    edges
+    |> Enum.reduce(g1, fn {source_id, out_neighbors}, acc ->
+      source = Map.get(vs, source_id)
+
+      out_neighbors
+      |> Enum.reduce(acc, fn out_neighbor, acc ->
+        target = Map.get(vs, out_neighbor)
+        meta = Map.get(meta, {source_id, out_neighbor})
+
+        Enum.reduce(meta, acc, fn {label, weight}, acc ->
+          Graph.add_edge(acc, source, target, label: label, weight: weight)
+        end)
+      end)
+    end)
+  end
+
+  @doc """
   Helper function to be used for GenStage alike processes to control
   demand and amount of produced events
   """
@@ -47,6 +78,58 @@ defmodule Electric.Utils do
 
   def list_last_and_length([_ | list], default, length),
     do: list_last_and_length(list, default, length + 1)
+
+  @doc """
+  Map each value of the enumerable using a mapper, unwrapping a result tuple returned by
+  the mapper and stopping on error.
+  """
+  @spec map_while_ok(Enumerable.t(elem), (elem -> {:ok, result} | {:error, term()})) ::
+          {:ok, list(result)} | {:error, term()}
+        when elem: var, result: var
+  def map_while_ok(enum, mapper) when is_function(mapper, 1) do
+    Enum.reduce_while(enum, {:ok, []}, fn elem, {:ok, acc} ->
+      case mapper.(elem) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, x} -> {:ok, Enum.reverse(x)}
+      error -> error
+    end
+  end
+
+  @doc """
+  Return a list of values from `enum` that are the maximal elements as calculated
+  by the given `fun`.
+
+  Base behaviour is similar to `Enum.max_by/4`, but this function returns a list
+  of all maximal values instead of just the first one.
+  """
+  def all_max_by(
+        enum,
+        fun,
+        sorter \\ &>=/2,
+        comparator \\ &==/2,
+        empty_fallback \\ fn -> raise(Enum.EmptyError) end
+      )
+
+  def all_max_by([], _, _, _, empty_fallback), do: empty_fallback.()
+
+  def all_max_by([head | tail], fun, sorter, comparator, _) when is_function(fun, 1) do
+    {_, max_values} =
+      Enum.reduce(tail, {fun.(head), [head]}, fn elem, {curr_max, agg} ->
+        new = fun.(elem)
+
+        cond do
+          comparator.(curr_max, new) -> {curr_max, [elem | agg]}
+          sorter.(curr_max, new) -> {curr_max, agg}
+          true -> {new, [elem]}
+        end
+      end)
+
+    Enum.reverse(max_values)
+  end
 
   @doc """
   Check if the list has any duplicates.
@@ -109,6 +192,34 @@ defmodule Electric.Utils do
   defp flatten_map([head | tail], fun, acc), do: flatten_map(tail, fun, [fun.(head) | acc])
 
   @doc """
+  Drop elements from the head of the list while the predicate returns a truthy value.
+
+  Returns a tuple: count of dropped elements, and the remaining list.
+
+  ## Examples
+
+     iex> list_count_drop_while([1, 2, 3, 4], & &1 != 3)
+     {2, [3, 4]}
+
+     iex> list_count_drop_while([], & &1 < 3)
+     {0, []}
+
+     iex> list_count_drop_while([1, 2, -1], & &1 < 3)
+     {3, []}
+  """
+  def list_count_drop_while(list, fun), do: list_count_drop_while(list, fun, 0)
+
+  defp list_count_drop_while([], _, acc), do: {acc, []}
+
+  defp list_count_drop_while([head | tail] = list, fun, acc) do
+    if fun.(head) do
+      list_count_drop_while(tail, fun, acc + 1)
+    else
+      {acc, list}
+    end
+  end
+
+  @doc """
   Generate a random UUID v4.
 
   Code taken from Ecto: https://github.com/elixir-ecto/ecto/blob/v3.10.2/lib/ecto/uuid.ex#L174
@@ -152,21 +263,24 @@ defmodule Electric.Utils do
 
   Code taken from Ecto: https://github.com/elixir-ecto/ecto/blob/v3.10.2/lib/ecto/uuid.ex#L25
   """
-  @spec validate_uuid(binary()) :: {:ok, String.t()} | :error
-  def validate_uuid(
+  @spec validate_uuid!(binary) :: String.t()
+  def validate_uuid!(
         <<a1, a2, a3, a4, a5, a6, a7, a8, ?-, b1, b2, b3, b4, ?-, c1, c2, c3, c4, ?-, d1, d2, d3,
           d4, ?-, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12>>
       ) do
     <<c(a1), c(a2), c(a3), c(a4), c(a5), c(a6), c(a7), c(a8), ?-, c(b1), c(b2), c(b3), c(b4), ?-,
       c(c1), c(c2), c(c3), c(c4), ?-, c(d1), c(d2), c(d3), c(d4), ?-, c(e1), c(e2), c(e3), c(e4),
       c(e5), c(e6), c(e7), c(e8), c(e9), c(e10), c(e11), c(e12)>>
-  catch
-    :error -> :error
-  else
-    hex_uuid -> {:ok, hex_uuid}
   end
 
-  def validate_uuid(_), do: :error
+  @spec validate_uuid(binary) :: {:ok, String.t()} | :error
+  def validate_uuid(uuid) do
+    try do
+      {:ok, validate_uuid!(uuid)}
+    rescue
+      FunctionClauseError -> :error
+    end
+  end
 
   @compile {:inline, c: 1}
 
@@ -192,20 +306,39 @@ defmodule Electric.Utils do
   defp c(?d), do: ?d
   defp c(?e), do: ?e
   defp c(?f), do: ?f
-  defp c(_), do: throw(:error)
 
-  def epgsql_config(config) do
-    config
-    |> Map.new()
-    |> Map.put(:nulls, [nil, :null, :undefined])
-    |> maybe_add_inet6()
+  @doc """
+  Output a 2-tuple relation (table) reference as pg-style `"schema"."table"`.
+  """
+  @spec inspect_relation({String.t(), String.t()}) :: String.t()
+  def inspect_relation({schema, name}) do
+    "#{inspect(schema)}.#{inspect(name)}"
   end
 
-  defp maybe_add_inet6(config) do
-    with %{ipv6: true} <- config do
-      config
-      |> Map.delete(:ipv6)
-      |> Map.put(:tcp_opts, [:inet6])
-    end
+  @doc """
+  Parse a markdown table from a string
+
+  Options:
+  - `after:` - taking a first table that comes right after a given substring.
+  """
+  @spec parse_md_table(String.t(), [{:after, String.t()}]) :: [[String.t(), ...]]
+  def parse_md_table(string, opts) do
+    string =
+      case Keyword.fetch(opts, :after) do
+        {:ok, split_on} -> List.last(String.split(string, split_on))
+        :error -> string
+      end
+
+    string
+    |> String.split("\n", trim: true)
+    |> Enum.drop_while(&(not String.starts_with?(&1, "|")))
+    |> Enum.take_while(&String.starts_with?(&1, "|"))
+    # Header and separator
+    |> Enum.drop(2)
+    |> Enum.map(fn line ->
+      line
+      |> String.split("|", trim: true)
+      |> Enum.map(&String.trim/1)
+    end)
   end
 end

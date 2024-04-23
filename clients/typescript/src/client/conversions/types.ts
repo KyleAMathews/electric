@@ -12,6 +12,9 @@ export enum PgBasicType {
   PG_VARCHAR = 'VARCHAR',
   PG_CHAR = 'CHAR',
   PG_UUID = 'UUID',
+  PG_JSON = 'JSON',
+  PG_JSONB = 'JSONB',
+  PG_BYTEA = 'BYTEA',
 }
 
 /**

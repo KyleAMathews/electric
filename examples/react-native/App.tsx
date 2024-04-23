@@ -1,35 +1,25 @@
-import 'react-native-get-random-values'
-import 'react-native-url-polyfill/auto'
+import 'react-native-get-random-values';
+import React from 'react';
+import {SafeAreaView, ScrollView, StatusBar} from 'react-native';
 
-import React, { type PropsWithChildren } from 'react'
-import {
-  SafeAreaView,
-  ScrollView,
-  StatusBar,
-  StyleSheet
-} from 'react-native'
-
-import { Colors, Header } from 'react-native/Libraries/NewAppScreen'
-
-import { Example } from './src/Example'
+import {styles} from './src/styles';
+import {ElectricProvider} from './src/ElectricProvider';
+import {Example} from './src/Example';
 
 const App = (): JSX.Element => {
   return (
-    <SafeAreaView style={ styles.container }>
-      <StatusBar barStyle={ 'light-content' } backgroundColor={ styles.container.backgroundColor } />
+    <SafeAreaView style={styles.appContainer}>
+      <StatusBar
+        barStyle={'light-content'}
+        backgroundColor={styles.appContainer.backgroundColor}
+      />
       <ScrollView contentInsetAdjustmentBehavior="automatic">
-        <Example />
+        <ElectricProvider>
+          <Example />
+        </ElectricProvider>
       </ScrollView>
     </SafeAreaView>
-  )
-}
+  );
+};
 
-const styles = StyleSheet.create({
-  container: {
-    backgroundColor: 'rgb(19,17,23)',
-    color: '#f5f5f5',
-    flex: 1
-  }
-})
-
-export default App
+export default App;

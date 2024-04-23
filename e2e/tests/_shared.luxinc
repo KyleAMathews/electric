@@ -14,17 +14,14 @@
     [newshell pg_1]
         [invoke start_psql pg_1 5432]
         -$fail_pattern
-        [timeout 2]
 
     [newshell electric]
-        [timeout 5]
-        !make start_electric_1
-        -$fail_pattern
-        ?START_REPLICATION SLOT
+        [invoke start_electric 1]
+        ??Successfully initialized Postgres connector "postgres_1"
         [progress setup finished]
 
     [shell postgres_logs]
-        ?logical replication apply worker for subscription "postgres_1" has started
+        ??has now caught up with upstream server
         # [@magnetised 2023-10-05] Prisma does stuff that causes errors, such
         # as trying to insert into non-existant tables (then creating the table
         # if it gets an error), so if I leave this fail_pattern match here the
@@ -34,8 +31,18 @@
     [newshell proxy_1]
         [invoke start_proxy pg_1 electric_1]
         -$fail_pattern
-        [timeout 2]
 
+[endmacro]
+
+[macro start_electric n]
+    !make start_electric_${n}
+    -$fail_pattern
+[endmacro]
+
+[macro stop_electric n]
+    !make stop_electric_${n}
+    ??Stopped
+    [invoke ok]
 [endmacro]
 
 [macro teardown]
@@ -47,9 +54,9 @@
 [macro client_session user_id session_id]
     [invoke log "user ${user_id}: session ${session_id}: start"]
     [local client_id=client_${user_id}_${session_id}]
-    !auth_config = Electric.Satellite.Auth.Secure.build_config!( \
-                     alg: "HS256", key: "integration-tests-signing-key-example" \
-                   )
+    !{:ok, auth_config} = Electric.Satellite.Auth.Secure.build_config( \
+                            alg: "HS256", key: "integration-tests-signing-key-example" \
+                          )
     ?$eprompt
     """!{:ok, conn} = TestWsClient.connect(
                         auth: %{auth_config: auth_config, user_id: "$user_id"},
@@ -67,9 +74,9 @@
 [macro client_session_continue user_id session_id position subscription_ids]
     [invoke log "user ${user_id}: session ${session_id}: start"]
     [local client_id=client_${user_id}_${session_id}]
-    !auth_config = Electric.Satellite.Auth.Secure.build_config!( \
-                     alg: "HS256", key: "integration-tests-signing-key-example" \
-                   )
+    !{:ok, auth_config} = Electric.Satellite.Auth.Secure.build_config( \
+                            alg: "HS256", key: "integration-tests-signing-key-example" \
+                          )
     ?$eprompt
     """!{:ok, conn} = TestWsClient.connect(
                         auth: %{auth_config: auth_config, user_id: "$user_id"},
@@ -89,16 +96,16 @@
 
 [macro elixir_client_subscribe tables]
     """!
-    {:ok, %{err: nil}} = TestWsClient.make_rpc_call(conn, "subscribe", ProtocolHelpers.subscription_request(request_1: [tables: ~w|$tables|]))
+    {:ok, %{err: nil}} = TestWsClient.make_rpc_call(conn, "subscribe", ProtocolHelpers.subscription_request(request_1: ~w|$tables|))
     """
-    ?$eprompt
+    ?rec \[\d+\]: %Electric.Satellite.SatSubsDataEnd\{\}
 [endmacro]
 
 [macro elixir_client_subscribe_with_id id tables]
     """!
-    {:ok, %{err: nil}} = TestWsClient.make_rpc_call(conn,  "subscribe", ProtocolHelpers.subscription_request("$id", request_1: [tables: ~w|$tables|]))
+    {:ok, %{err: nil}} = TestWsClient.make_rpc_call(conn,  "subscribe", ProtocolHelpers.subscription_request("$id", request_1: ~w|$tables|))
     """
-    ?$eprompt
+    ?rec \[\d+\]: %Electric.Satellite.SatSubsDataEnd\{\}
 [endmacro]
 
 
@@ -134,6 +141,19 @@
             intvalue_null_default integer
         );
         ALTER TABLE public.items ENABLE ELECTRIC;
+        """]
+    [invoke migrate_pg $version $sql]
+[endmacro]
+
+[macro migrate_other_items_table version]
+    [local sql=
+        """
+        CREATE TABLE public.other_items (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            item_id UUID REFERENCES public.items(id)
+        );
+        ALTER TABLE public.other_items ENABLE ELECTRIC;
         """]
     [invoke migrate_pg $version $sql]
 [endmacro]

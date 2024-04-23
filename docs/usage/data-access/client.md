@@ -11,7 +11,7 @@ Generate this Typescript client as part of your build process, instantiate it wi
 
 ## Generating the client
 
-Use the [generator script](../../api/generator.md) to generate the [Typescript client](../installation/client.md):
+Use the [generator command](../../api/cli.md#generate) to generate the [Typescript client](../installation/client.md):
 
 ```shell
 npx electric-sql generate
@@ -25,8 +25,9 @@ The exact code for instantiating your database client depends on the SQLite driv
 
 1. initialise an SQLite database connection (`conn`) using your underlying driver
 2. import your database schema (`schema`) from the `./generated/client` folder
-3. configure your [authentication token](../auth/index.md) (`config.auth.token`)
+3. optionally define a custom configuration `config`
 4. pass these to your driver's `electrify` function to instantiate the client
+5. connect to Electric using your [authentication token](../auth/index.md)
 
 For example, for [wa-sqlite](../../integrations/drivers/web/wa-sqlite.md) in the web browser:
 
@@ -35,15 +36,15 @@ import { ElectricDatabase, electrify } from 'electric-sql/wa-sqlite'
 import { schema } from './generated/client'
 
 const config = {
-  auth: {
-    token: '...'
-  }
+  url: "http://localhost:5133",
+  debug: true
 }
 
 const init = async () => {
-  const conn = await ElectricDatabase.init('my.db', '/')
-
-  return electrify(conn, schema, config)
+  const conn = await ElectricDatabase.init('my.db')
+  const electric = await electrify(conn, schema, config)
+  await electric.connect('your token')
+  return electric
 }
 ```
 

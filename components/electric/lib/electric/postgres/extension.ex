@@ -3,7 +3,9 @@ defmodule Electric.Postgres.Extension do
   Manages our pseudo-extension code
   """
 
-  alias Electric.Postgres.{Schema, Schema.Proto, Extension.Functions, Extension.Migration}
+  import Electric.Postgres.Dialect.Postgresql, only: [quote_ident: 2]
+
+  alias Electric.Postgres.{Schema, Schema.Proto, Extension.Functions, Extension.Migration, Types}
   alias Electric.Replication.Postgres.Client
   alias Electric.Utils
 
@@ -22,26 +24,37 @@ defmodule Electric.Postgres.Extension do
   @version_relation "migration_versions"
   @ddl_relation "ddl_commands"
   @schema_relation "schema"
-  @electrified_table_relation "electrified"
+  @electrified_tracking_relation "electrified"
+  @transaction_marker_relation "transaction_marker"
   @acked_client_lsn_relation "acknowledged_client_lsns"
+  @client_actions_relation "client_actions"
+  @client_shape_subscriptions_relation "client_shape_subscriptions"
+  @client_checkpoints_relation "client_checkpoints"
+  @client_additional_data_relation "client_additional_data"
 
   @grants_relation "grants"
   @roles_relation "roles"
   @assignments_relation "assignments"
 
-  electric = &to_string([?", @schema, ?", ?., ?", &1, ?"])
+  electric = &quote_ident(@schema, &1)
 
   @migration_table electric.("schema_migrations")
   @version_table electric.(@version_relation)
   @ddl_table electric.(@ddl_relation)
   @schema_table electric.("schema")
-  @electrified_tracking_table electric.(@electrified_table_relation)
-  @transaction_marker_table electric.("transaction_marker")
+  @electrified_tracking_table electric.(@electrified_tracking_relation)
+  @transaction_marker_table electric.(@transaction_marker_relation)
   @acked_client_lsn_table electric.(@acked_client_lsn_relation)
+  @client_actions_table electric.(@client_actions_relation)
+  @client_shape_subscriptions_table electric.(@client_shape_subscriptions_relation)
+  @client_checkpoints_table electric.(@client_checkpoints_relation)
+  @client_additional_data_table electric.(@client_additional_data_relation)
 
   @grants_table electric.(@grants_relation)
   @roles_table electric.(@roles_relation)
   @assignments_table electric.(@assignments_relation)
+
+  @client_additional_data_subject_type electric.("client_additional_data_subject")
 
   @all_schema_query ~s(SELECT "schema", "version", "migration_ddl" FROM #{@schema_table} ORDER BY "version" ASC)
   @current_schema_query ~s(SELECT "schema", "version" FROM #{@schema_table} ORDER BY "id" DESC LIMIT 1)
@@ -103,10 +116,13 @@ defmodule Electric.Postgres.Extension do
   def ddl_table, do: @ddl_table
   def schema_table, do: @schema_table
   def version_table, do: @version_table
-  def electrified_tracking_relation, do: @electrified_table_relation
   def electrified_tracking_table, do: @electrified_tracking_table
   def transaction_marker_table, do: @transaction_marker_table
   def acked_client_lsn_table, do: @acked_client_lsn_table
+  def client_actions_table, do: @client_actions_table
+  def client_shape_subscriptions_table, do: @client_shape_subscriptions_table
+  def client_checkpoints_table, do: @client_checkpoints_table
+  def client_additional_data_table, do: @client_additional_data_table
 
   def grants_table, do: @grants_table
   def roles_table, do: @roles_table
@@ -115,10 +131,14 @@ defmodule Electric.Postgres.Extension do
   def ddl_relation, do: {@schema, @ddl_relation}
   def version_relation, do: {@schema, @version_relation}
   def schema_relation, do: {@schema, @schema_relation}
+  def electrified_tracking_relation, do: {@schema, @electrified_tracking_relation}
   def acked_client_lsn_relation, do: {@schema, @acked_client_lsn_relation}
+
   def publication_name, do: @publication_name
   def slot_name, do: @slot_name
   def subscription_name, do: @subscription_name
+
+  def client_additional_data_subject_type, do: @client_additional_data_subject_type
 
   defguard is_extension_relation(relation) when elem(relation, 0) == @schema
 
@@ -228,7 +248,7 @@ defmodule Electric.Postgres.Extension do
         version: version,
         txid: String.to_integer(txid_str),
         txts: txts,
-        timestamp: decode_epgsql_timestamp(timestamp),
+        timestamp: Types.DateTime.from_epgsql(timestamp),
         schema: Proto.Schema.json_decode!(schema_json),
         stmts: stmts
       }
@@ -262,6 +282,43 @@ defmodule Electric.Postgres.Extension do
     end
   end
 
+  @electrified_tables_query "SELECT schema_name, table_name FROM #{@electrified_tracking_table}"
+
+  @spec electrified_tables(conn()) :: {:ok, [{String.t(), String.t()}]} | {:error, term}
+  def electrified_tables(conn) do
+    with {:ok, _, tables} <- :epgsql.squery(conn, @electrified_tables_query) do
+      {:ok, tables}
+    end
+  end
+
+  # These are tables in the "electric" schema, each of which was added to the publication in
+  # one of the extension migrations. They can be found by searching the codebase for
+  # "add_table_to_publication_sql".
+  @published_extension_tables [
+    {@schema, @ddl_relation},
+    {@schema, @electrified_tracking_relation},
+    {@schema, @transaction_marker_relation},
+    {@schema, @grants_relation},
+    {@schema, @roles_relation},
+    {@schema, @assignments_relation},
+    {@schema, @acked_client_lsn_relation}
+  ]
+
+  @doc """
+  The list of fully-qualified table identifiers that should be included in "#{@publication_name}".
+
+  This includes extension tables and all user tables that have been electrified, along with
+  their shadow tables.
+  """
+  @spec published_tables(conn()) :: {:ok, [{String.t(), String.t()}]} | {:error, term}
+  def published_tables(conn) do
+    with {:ok, tables} <- electrified_tables(conn) do
+      tables_with_shadows = Enum.flat_map(tables, &[&1, shadow_of(&1)])
+      published_tables = Enum.concat(tables_with_shadows, @published_extension_tables)
+      {:ok, published_tables}
+    end
+  end
+
   def create_table_ddl(conn, %Proto.RangeVar{} = table_name) do
     name = to_string(table_name)
 
@@ -287,14 +344,14 @@ defmodule Electric.Postgres.Extension do
 
   @spec define_functions(conn) :: :ok
   def define_functions(conn) do
-    Enum.each(Functions.list(), fn {name, sql} ->
-      case :epgsql.squery(conn, sql) do
-        {:ok, [], []} ->
-          Logger.debug("Successfully (re)defined SQL function/procedure '#{name}'")
-          :ok
-
-        error ->
-          raise "Failed to define function '#{name}' with error: #{inspect(error)}"
+    Enum.each(Functions.list(), fn {path, sql} ->
+      conn
+      |> :epgsql.squery(sql)
+      |> List.wrap()
+      |> Enum.find(&(not match?({:ok, [], []}, &1)))
+      |> case do
+        nil -> Logger.debug("Successfully (re)defined SQL routine from '#{path}'")
+        error -> raise "Failed to define SQL routine from '#{path}' with error: #{inspect(error)}"
       end
     end)
   end
@@ -317,7 +374,12 @@ defmodule Electric.Postgres.Extension do
       Migrations.Migration_20230921161418_ProxyCompatibility,
       Migrations.Migration_20231009121515_AllowLargeMigrations,
       Migrations.Migration_20231010123118_AddPriorityToVersion,
-      Migrations.Migration_20231016141000_ConvertFunctionToProcedure
+      Migrations.Migration_20231016141000_ConvertFunctionToProcedure,
+      Migrations.Migration_20231206130400_ConvertReplicaTriggersToAlways,
+      Migrations.Migration_20240110110200_DropUnusedFunctions,
+      Migrations.Migration_20240205141200_ReinstallTriggerFunctionWriteCorrectMaxTag,
+      Migrations.Migration_20240213160300_DropGenerateElectrifiedSqlFunction,
+      Migrations.Migration_20240417131000_ClientReconnectionInfoTables
     ]
   end
 
@@ -356,7 +418,9 @@ defmodule Electric.Postgres.Extension do
           end)
         end)
 
-      :ok = define_functions(txconn)
+      if module == __MODULE__ do
+        :ok = define_functions(txconn)
+      end
 
       {:ok, newly_applied_versions}
     end)
@@ -456,10 +520,20 @@ defmodule Electric.Postgres.Extension do
     ~s|ALTER PUBLICATION "#{@publication_name}" ADD TABLE #{table}#{column_list}|
   end
 
+  @shadow_prefix "shadow__"
+  @tombstone_prefix "tombstone__"
+
   @doc """
-  Returns a relation that is the shadow table of the passed-in relation.
+  Returns a relation that is the shadow table of the given relation.
   """
-  def shadow_of({schema, table}), do: {@schema, "shadow__#{schema}__#{table}"}
+  @spec shadow_of({binary, binary}) :: {binary, binary}
+  def shadow_of({schema, table}), do: {@schema, @shadow_prefix <> schema <> "__" <> table}
+
+  @doc """
+  Returns a relation that is the tombstone table of the given relation.
+  """
+  @spec tombstone_of({binary, binary}) :: {binary, binary}
+  def tombstone_of({schema, table}), do: {@schema, @tombstone_prefix <> schema <> "__" <> table}
 
   @doc """
   Returns true if a given relation is a shadow table under current naming convention.
@@ -467,7 +541,7 @@ defmodule Electric.Postgres.Extension do
   defguard is_shadow_relation(relation)
            when elem(relation, 0) == @schema and is_binary(elem(relation, 1)) and
                   byte_size(elem(relation, 1)) >= 8 and
-                  binary_part(elem(relation, 1), 0, 8) == "shadow__"
+                  binary_part(elem(relation, 1), 0, 8) == @shadow_prefix
 
   @doc """
   Returns true if a given relation is a tombstone table under current naming convention.
@@ -475,7 +549,7 @@ defmodule Electric.Postgres.Extension do
   defguard is_tombstone_relation(relation)
            when elem(relation, 0) == @schema and is_binary(elem(relation, 1)) and
                   byte_size(elem(relation, 1)) >= 11 and
-                  binary_part(elem(relation, 1), 0, 11) == "tombstone__"
+                  binary_part(elem(relation, 1), 0, 11) == @tombstone_prefix
 
   @doc """
   Returns primary keys list for a given shadow record.
@@ -509,16 +583,6 @@ defmodule Electric.Postgres.Extension do
 
   defp known_shadow_column?(_), do: false
 
-  defp decode_epgsql_timestamp({date, {h, m, frac_sec}}) do
-    sec = trunc(frac_sec)
-    microsec = trunc((frac_sec - sec) * 1_000_000)
-    DateTime.from_naive!(NaiveDateTime.from_erl!({date, {h, m, sec}}, {microsec, 6}), "Etc/UTC")
-  end
-
-  def encode_epgsql_timestamp(%DateTime{} = dt) do
-    dt |> DateTime.to_naive() |> NaiveDateTime.to_erl()
-  end
-
   @doc """
   Perform a mostly no-op update to a transaction marker query to make sure
   there is at least one write to Postgres after this point.
@@ -539,15 +603,19 @@ defmodule Electric.Postgres.Extension do
   end
 
   @last_acked_client_lsn_equery "SELECT lsn FROM #{@acked_client_lsn_table} WHERE client_id = $1"
+  @spec fetch_last_acked_client_lsn(pid(), binary()) :: {:ok, binary() | nil} | {:error, term()}
   def fetch_last_acked_client_lsn(conn, client_id) do
     case :epgsql.equery(conn, @last_acked_client_lsn_equery, [client_id]) do
       {:ok, _, [{lsn}]} ->
         # No need for a decoding step here because :epgsql.equery() uses Postgres' binary protocol, so a BYTEA value
         # is returned as a raw binary.
-        lsn
+        {:ok, lsn}
 
       {:ok, _, []} ->
-        nil
+        {:ok, nil}
+
+      {:error, _} = error ->
+        error
     end
   end
 

@@ -3,28 +3,36 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
   import Mock
 
   alias Electric.Postgres.Extension.SchemaLoader
-  alias Electric.Replication.Postgres.LogicalReplicationProducer
-
-  alias Electric.Replication.Changes.{NewRecord, UpdatedRecord, Transaction, Relation}
   alias Electric.Postgres.LogicalReplication
   alias Electric.Postgres.LogicalReplication.Messages
   alias Electric.Postgres.Lsn
-  alias Electric.Replication.Postgres.Client
+
+  alias Electric.Replication.Changes.{NewRecord, UpdatedRecord, Transaction}
   alias Electric.Replication.Connectors
+  alias Electric.Replication.Postgres.Client
+  alias Electric.Replication.Postgres.LogicalReplicationProducer
+
+  @uuid_oid 2950
+  @varchar_oid 1043
 
   setup_with_mocks([
     {Client, [:passthrough],
      [
+       with_conn: fn _, fun -> fun.(:conn) end,
        connect: fn _ -> {:ok, :conn} end,
-       start_replication: fn :conn, _, _, _ -> :ok end,
-       create_slot: fn :conn, name -> {:ok, name} end,
+       start_replication: fn :conn, _, _, _, _ -> :ok end,
+       create_main_slot: fn :conn, name -> {:ok, name} end,
+       create_temporary_slot: fn :conn, _main_name, tmp_name -> {:ok, tmp_name, %Lsn{}} end,
+       current_lsn: fn :conn -> {:ok, %Lsn{}} end,
+       advance_replication_slot: fn _, _, _ -> :ok end,
        set_display_settings_for_replication: fn _ -> :ok end,
        get_server_versions: fn :conn -> {:ok, {"", "", ""}} end
      ]},
     {Connectors, [:passthrough],
      [
        get_replication_opts: fn _ -> %{publication: "mock_pub", slot: "mock_slot"} end,
-       get_connection_opts: fn _, _ -> %{} end
+       get_connection_opts: fn _ -> %{ip_addr: {0, 0, 0, 1}} end,
+       get_connection_opts: fn _, _ -> %{ip_addr: {0, 0, 0, 2}} end
      ]},
     {SchemaLoader, [:passthrough],
      [
@@ -37,7 +45,7 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
   test "Producer complies a transaction into a single message" do
     {_, events} =
       begin()
-      |> relation("entities", id: :uuid, data: :varchar)
+      |> relation("entities", id: @uuid_oid, data: @varchar_oid)
       |> insert("entities", ["test", "value"])
       |> commit_and_get_messages()
       |> process_messages(
@@ -45,7 +53,7 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
         &LogicalReplicationProducer.handle_info/2
       )
 
-    assert [%Relation{name: "entities"}, %Transaction{} = transaction] = events
+    assert [%Transaction{} = transaction] = events
 
     assert [%NewRecord{record: %{"id" => "test", "data" => "value"}}] = transaction.changes
   end
@@ -53,7 +61,7 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
   test "Producer keeps proper ordering of updates within the transaction for inserts" do
     {_, events} =
       begin()
-      |> relation("entities", id: :uuid, data: :varchar)
+      |> relation("entities", id: @uuid_oid, data: @varchar_oid)
       |> insert("entities", ["test1", "value"])
       |> insert("entities", ["test2", "value"])
       |> insert("entities", ["test3", "value"])
@@ -64,7 +72,7 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
         &LogicalReplicationProducer.handle_info/2
       )
 
-    assert [%Relation{name: "entities"}, %Transaction{} = transaction] = events
+    assert [%Transaction{} = transaction] = events
     assert length(transaction.changes) == 4
 
     assert [
@@ -78,7 +86,7 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
   test "Producer keeps proper ordering of updates within the transaction for updates" do
     {_, events} =
       begin()
-      |> relation("entities", id: :uuid, data: :varchar)
+      |> relation("entities", id: @uuid_oid, data: @varchar_oid)
       |> insert("entities", ["test", "1"])
       |> update("entities", ["test", "1"], ["test", "2"])
       |> update("entities", ["test", "2"], ["test", "3"])
@@ -90,7 +98,7 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
         &LogicalReplicationProducer.handle_info/2
       )
 
-    assert [%Relation{name: "entities"}, %Transaction{} = transaction] = events
+    assert [%Transaction{} = transaction] = events
     assert length(transaction.changes) == 5
 
     assert [
@@ -102,8 +110,19 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
            ] = transaction.changes
   end
 
+  test "Producer schedules a timer for advancing the main slot" do
+    %LogicalReplicationProducer.State{advance_timer: tref} = initialize_producer()
+    assert_receive {:timeout, ^tref, :advance_main_slot}, 2_000
+  end
+
   def initialize_producer(demand \\ 100) do
-    {:producer, state} = LogicalReplicationProducer.init(origin: "mock_postgres")
+    {:producer, state} =
+      LogicalReplicationProducer.init(
+        origin: "mock_postgres",
+        wal_window: [in_memory_size: 1, resumable_size: 1],
+        connection: %{}
+      )
+
     {_, _, state} = LogicalReplicationProducer.handle_demand(demand, state)
     state
   end
@@ -135,22 +154,13 @@ defmodule Electric.Replication.Postgres.LogicalReplicationProducerTest do
       replica_identity: :all_columns,
       namespace: "public",
       columns:
-        Enum.map(columns, fn
-          {name, type} when is_atom(type) ->
-            %Messages.Relation.Column{
-              flags: [],
-              name: Atom.to_string(name),
-              type: type,
-              type_modifier: 0
-            }
-
-          {name, {type, :key}} ->
-            %Messages.Relation.Column{
-              flags: [:key],
-              name: Atom.to_string(name),
-              type: type,
-              type_modifier: 0
-            }
+        Enum.map(columns, fn {name, type_oid} ->
+          %Messages.Relation.Column{
+            flags: [],
+            name: Atom.to_string(name),
+            type_oid: type_oid,
+            type_modifier: 0
+          }
         end)
     })
   end

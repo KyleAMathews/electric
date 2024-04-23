@@ -1,12 +1,12 @@
 import { mkdir, rm as removeFile } from 'node:fs/promises'
-import { randomValue } from '../../src/util'
+import { RelationsCache, randomValue } from '../../src/util'
 import Database from 'better-sqlite3'
 import type { Database as SqliteDB } from 'better-sqlite3'
 import { DatabaseAdapter } from '../../src/drivers/better-sqlite3'
 import { BundleMigrator } from '../../src/migrators'
 import { EventNotifier, MockNotifier } from '../../src/notifiers'
 import { MockSatelliteClient } from '../../src/satellite/mock'
-import { SatelliteProcess } from '../../src/satellite'
+import { GlobalRegistry, Registry, SatelliteProcess } from '../../src/satellite'
 import { TableInfo, initTableInfo } from '../support/satellite-helpers'
 import { satelliteDefaults, SatelliteOpts } from '../../src/satellite/config'
 import { Table, generateTableTriggers } from '../../src/migrators/triggers'
@@ -51,13 +51,13 @@ export const relations = {
         name: 'id',
         type: 'INTEGER',
         isNullable: false,
-        primaryKey: true,
+        primaryKey: 1,
       },
       {
         name: 'parent',
         type: 'INTEGER',
         isNullable: true,
-        primaryKey: false,
+        primaryKey: undefined,
       },
     ],
   },
@@ -71,19 +71,19 @@ export const relations = {
         name: 'id',
         type: 'INTEGER',
         isNullable: false,
-        primaryKey: true,
+        primaryKey: 1,
       },
       {
         name: 'value',
         type: 'TEXT',
         isNullable: true,
-        primaryKey: false,
+        primaryKey: undefined,
       },
       {
         name: 'other',
         type: 'INTEGER',
         isNullable: true,
-        primaryKey: false,
+        primaryKey: undefined,
       },
     ],
   },
@@ -97,27 +97,39 @@ export const relations = {
         name: 'id',
         type: 'INTEGER',
         isNullable: false,
-        primaryKey: true,
+        primaryKey: 1,
       },
     ],
   },
-  floatTable: {
+  mergeTable: {
     id: 3,
     schema: 'public',
-    table: 'floatTable',
+    table: 'mergeTable',
     tableType: 0,
     columns: [
       {
         name: 'id',
         type: 'INTEGER',
         isNullable: false,
-        primaryKey: true,
+        primaryKey: 1,
       },
       {
-        name: 'value',
+        name: 'real',
         type: 'REAL',
         isNullable: true,
-        primaryKey: false,
+        primaryKey: undefined,
+      },
+      {
+        name: 'int8',
+        type: 'INT8',
+        isNullable: true,
+        primaryKey: undefined,
+      },
+      {
+        name: 'bigint',
+        type: 'BIGINT',
+        isNullable: true,
+        primaryKey: undefined,
       },
     ],
   },
@@ -131,36 +143,78 @@ export const relations = {
         name: 'id',
         type: 'REAL',
         isNullable: false,
-        primaryKey: true,
+        primaryKey: 1,
       },
       {
         name: 'name',
         type: 'TEXT',
         isNullable: true,
-        primaryKey: false,
+        primaryKey: undefined,
       },
       {
         name: 'age',
         type: 'INTEGER',
         isNullable: true,
-        primaryKey: false,
+        primaryKey: undefined,
       },
       {
         name: 'bmi',
         type: 'REAL',
         isNullable: true,
-        primaryKey: false,
+        primaryKey: undefined,
+      },
+      {
+        name: 'int8',
+        type: 'INT8',
+        isNullable: true,
+        primaryKey: undefined,
+      },
+      {
+        name: 'blob',
+        type: 'BYTEA',
+        isNullable: true,
+        primaryKey: undefined,
       },
     ],
   },
-}
+  bigIntTable: {
+    id: 5,
+    schema: 'public',
+    table: 'bigIntTable',
+    tableType: 0,
+    columns: [
+      {
+        name: 'value',
+        type: 'INT8',
+        isNullable: false,
+        primaryKey: 1,
+      },
+    ],
+  },
+  blobTable: {
+    id: 6,
+    schema: 'public',
+    table: 'blobTable',
+    tableType: 0,
+    columns: [
+      {
+        name: 'value',
+        type: 'BYTEA',
+        isNullable: false,
+        primaryKey: undefined,
+      },
+    ],
+  },
+} satisfies RelationsCache
 
 import migrations from '../support/migrations/migrations.js'
 import { ExecutionContext } from 'ava'
-import { AuthState } from '../../src/auth'
+import { AuthState, insecureAuthToken } from '../../src/auth'
 import { DbSchema, TableSchema } from '../../src/client/model/schema'
 import { PgBasicType } from '../../src/client/conversions/types'
 import { HKT } from '../../src/client/util/hkt'
+import { ElectricClient } from '../../src/client/model'
+import EventEmitter from 'events'
 
 // Speed up the intervals for testing.
 export const opts = Object.assign({}, satelliteDefaults, {
@@ -187,6 +241,7 @@ export type ContextType<Extra = {}> = {
   tableInfo: TableInfo
   timestamp: number
   authState: AuthState
+  token: string
 } & Extra
 
 export const makeContext = async (
@@ -198,7 +253,7 @@ export const makeContext = async (
   const db = new Database(dbName)
   const adapter = new DatabaseAdapter(db)
   const migrator = new BundleMigrator(adapter, migrations)
-  const notifier = new MockNotifier(dbName)
+  const notifier = new MockNotifier(dbName, new EventEmitter())
   const client = new MockSatelliteClient()
   const satellite = new SatelliteProcess(
     dbName,
@@ -216,7 +271,8 @@ export const makeContext = async (
     await migrator.up()
   }
 
-  const authState = { clientId: '', token: 'test-token' }
+  const authState = { clientId: '' }
+  const token = insecureAuthToken({ sub: 'test-user' })
 
   t.context = {
     dbName,
@@ -228,7 +284,43 @@ export const makeContext = async (
     tableInfo,
     timestamp,
     authState,
+    token,
   }
+}
+
+export const mockElectricClient = async (
+  db: SqliteDB,
+  registry: Registry | GlobalRegistry,
+  options: Opts = opts
+): Promise<ElectricClient<any>> => {
+  const dbName = db.name
+  const adapter = new DatabaseAdapter(db)
+  const migrator = new BundleMigrator(adapter, migrations)
+  const notifier = new MockNotifier(dbName, new EventEmitter())
+  const client = new MockSatelliteClient()
+  const satellite = new SatelliteProcess(
+    dbName,
+    adapter,
+    migrator,
+    notifier,
+    client,
+    options
+  )
+
+  await satellite.start({ clientId: '' })
+  registry.satellites[dbName] = satellite
+
+  // @ts-ignore Mock Electric client that does not contain the DAL
+  const electric = new ElectricClient(
+    {},
+    dbName,
+    adapter,
+    notifier,
+    satellite,
+    registry
+  )
+  await electric.connect(insecureAuthToken({ sub: 'test-token' }))
+  return electric
 }
 
 export const clean = async (t: ExecutionContext<{ dbName: string }>) => {
@@ -249,7 +341,7 @@ export const cleanAndStopSatellite = async (
 export function migrateDb(db: SqliteDB, table: Table) {
   const tableName = table.tableName
   // Create the table in the database
-  const createTableSQL = `CREATE TABLE ${tableName} (id REAL PRIMARY KEY, name TEXT, age INTEGER, bmi REAL)`
+  const createTableSQL = `CREATE TABLE ${tableName} (id REAL PRIMARY KEY, name TEXT, age INTEGER, bmi REAL, int8 INTEGER, blob BLOB)`
   db.exec(createTableSQL)
 
   // Apply the initial migration on the database
@@ -270,13 +362,15 @@ export function migrateDb(db: SqliteDB, table: Table) {
 export const personTable: Table = {
   namespace: 'main',
   tableName: 'personTable',
-  columns: ['id', 'name', 'age', 'bmi'],
+  columns: ['id', 'name', 'age', 'bmi', 'int8', 'blob'],
   primary: ['id'],
   foreignKeys: [],
   columnTypes: {
-    id: 'REAL',
-    name: 'TEXT',
-    age: 'INTEGER',
-    bmi: 'REAL',
+    id: { sqliteType: 'REAL', pgType: PgBasicType.PG_REAL },
+    name: { sqliteType: 'TEXT', pgType: PgBasicType.PG_TEXT },
+    age: { sqliteType: 'INTEGER', pgType: PgBasicType.PG_INTEGER },
+    bmi: { sqliteType: 'REAL', pgType: PgBasicType.PG_REAL },
+    int8: { sqliteType: 'INTEGER', pgType: PgBasicType.PG_INT8 },
+    blob: { sqliteType: 'BLOB', pgType: PgBasicType.PG_BYTEA },
   },
 }

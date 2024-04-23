@@ -1,12 +1,13 @@
 import { ElectricNamespace } from '../../electric/namespace'
 import { DbSchema, TableSchema } from './schema'
-import { liveRaw, raw, Table } from './table'
+import { rawQuery, liveRawQuery, unsafeExec, Table } from './table'
 import { Row, Statement } from '../../util'
 import { LiveResult, LiveResultContext } from './model'
 import { Notifier } from '../../notifiers'
 import { DatabaseAdapter } from '../../electric/adapter'
-import { Satellite } from '../../satellite'
+import { GlobalRegistry, Registry, Satellite } from '../../satellite'
 import { ShapeManager } from './shapes'
+import { ReplicationTransformManager } from './transforms'
 
 export type ClientTables<DB extends DbSchema<any>> = {
   [Tbl in keyof DB['tables']]: DB['tables'][Tbl] extends TableSchema<
@@ -38,13 +39,45 @@ export type ClientTables<DB extends DbSchema<any>> = {
 
 interface RawQueries {
   /**
+   * Executes a raw SQL query without protecting against modifications
+   * to the store that are incompatible with the replication mechanism
+   *
+   * [WARNING]: might break data replication, use with care!
+   * @param sql - A raw SQL query and its bind parameters.
+   * @returns The rows that result from the query.
+   */
+  unsafeExec(sql: Statement): Promise<Row[]>
+
+  /**
+   * Executes a read-only raw SQL query.
+   * @param sql - A raw SQL query and its bind parameters.
+   * @returns The rows that result from the query.
+   */
+  rawQuery(sql: Statement): Promise<Row[]>
+
+  /**
+   * A read-only raw SQL query that can be used with {@link useLiveQuery}.
+   * Same as {@link RawQueries#raw} but wraps the result in a {@link LiveResult} object.
+   * @param sql - A raw SQL query and its bind parameters.
+   */
+  liveRawQuery(sql: Statement): LiveResultContext<any>
+
+  /**
+   * @deprecated
+   * For safe, read-only SQL queries, use the `rawQuery` API
+   * For unsafe, store-modifying queries, use the `unsafeExec` API
+   *
    * Executes a raw SQL query.
    * @param sql - A raw SQL query and its bind parameters.
    * @returns The rows that result from the query.
    */
   raw(sql: Statement): Promise<Row[]>
+
   /**
-   * A raw SQL query that can be used with {@link useLiveQuery}.
+   * @deprecated
+   * Use `liveRawQuery` instead for reactive read-only SQL queries.
+   *
+   * A read-only raw SQL query that can be used with {@link useLiveQuery}.
    * Same as {@link RawQueries#raw} but wraps the result in a {@link LiveResult} object.
    * @param sql - A raw SQL query and its bind parameters.
    */
@@ -59,30 +92,53 @@ interface RawQueries {
 export class ElectricClient<
   DB extends DbSchema<any>
 > extends ElectricNamespace {
-  private _satellite: Satellite
-  public get satellite(): Satellite {
-    return this._satellite
-  }
-
   private constructor(
     public db: ClientTables<DB> & RawQueries,
+    dbName: string,
     adapter: DatabaseAdapter,
     notifier: Notifier,
-    satellite: Satellite
+    public readonly satellite: Satellite,
+    registry: Registry | GlobalRegistry
   ) {
-    super(adapter, notifier)
-    this._satellite = satellite
+    super(dbName, adapter, notifier, registry)
+    this.satellite = satellite
+  }
+
+  /**
+   * Connects to the Electric sync service.
+   * This method is idempotent, it is safe to call it multiple times.
+   * @param token - The JWT token to use to connect to the Electric sync service.
+   *                This token is required on first connection but can be left out when reconnecting
+   *                in which case the last seen token is reused.
+   */
+  async connect(token?: string): Promise<void> {
+    if (token === undefined && !this.satellite.hasToken()) {
+      throw new Error('A token is required the first time you connect.')
+    }
+    if (token !== undefined) {
+      this.satellite.setToken(token)
+    }
+    await this.satellite.connectWithBackoff()
+  }
+
+  disconnect(): void {
+    this.satellite.clientDisconnect()
   }
 
   // Builds the DAL namespace from a `dbDescription` object
   static create<DB extends DbSchema<any>>(
+    dbName: string,
     dbDescription: DB,
     adapter: DatabaseAdapter,
     notifier: Notifier,
-    satellite: Satellite
+    satellite: Satellite,
+    registry: Registry | GlobalRegistry
   ): ElectricClient<DB> {
     const tables = dbDescription.extendedTables
     const shapeManager = new ShapeManager(satellite)
+    const replicationTransformManager = new ReplicationTransformManager(
+      satellite
+    )
 
     const createTable = (tableName: string) => {
       return new Table(
@@ -90,6 +146,7 @@ export class ElectricClient<
         adapter,
         notifier,
         shapeManager,
+        replicationTransformManager,
         dbDescription
       )
     }
@@ -108,10 +165,20 @@ export class ElectricClient<
 
     const db: ClientTables<DB> & RawQueries = {
       ...dal,
-      raw: raw.bind(null, adapter),
-      liveRaw: liveRaw.bind(null, adapter),
+      unsafeExec: unsafeExec.bind(null, adapter),
+      rawQuery: rawQuery.bind(null, adapter),
+      liveRawQuery: liveRawQuery.bind(null, adapter, notifier),
+      raw: unsafeExec.bind(null, adapter),
+      liveRaw: liveRawQuery.bind(null, adapter, notifier),
     }
 
-    return new ElectricClient(db, adapter, notifier, satellite)
+    return new ElectricClient(
+      db,
+      dbName,
+      adapter,
+      notifier,
+      satellite,
+      registry
+    )
   }
 }

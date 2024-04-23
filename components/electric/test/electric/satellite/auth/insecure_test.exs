@@ -28,14 +28,16 @@ defmodule Electric.Satellite.Auth.InsecureTest do
 
       token = unsigned_token(claims)
 
-      assert {:ok, %Auth{user_id: "12345"}} ==
+      assert {:ok, %Auth{user_id: "12345", expires_at: claims["exp"]}} ==
                validate_token(token, config(namespace: @namespace))
 
       ###
 
-      claims = %{"user_id" => "0"}
+      claims = %{"user_id" => "0", "exp" => DateTime.to_unix(~U[2123-05-01 00:00:00Z])}
       token = unsigned_token(claims)
-      assert {:ok, %Auth{user_id: "0"}} == validate_token(token, config([]))
+
+      assert {:ok, %Auth{user_id: "0", expires_at: claims["exp"]}} ==
+               validate_token(token, config([]))
     end
 
     test "successfully extracts the namespaced user_id claim" do
@@ -85,15 +87,18 @@ defmodule Electric.Satellite.Auth.InsecureTest do
       end
     end
 
-    defp unsigned_token(claims) do
-      # With yajwt it was possible to simply call
-      #
-      #     JWT.sign(claims, %{alg: "none"})
-      #
-      # But Joken does not support the "none" signing algorithm. Hence the manual encoding.
+    defp unsigned_token(claims, opts \\ []) do
       header = encode_part(%{typ: "JWT", alg: "none"})
       payload = encode_part(claims)
-      header <> "." <> payload <> "."
+
+      signature =
+        if Keyword.get(opts, :trailing_dot, true) do
+          "."
+        else
+          ""
+        end
+
+      header <> "." <> payload <> signature
     end
 
     defp encode_part(map) do
@@ -114,7 +119,7 @@ defmodule Electric.Satellite.Auth.InsecureTest do
 
       token = signed_token(claims)
 
-      assert {:ok, %Auth{user_id: "12345"}} ==
+      assert {:ok, %Auth{user_id: "12345", expires_at: claims["exp"]}} ==
                validate_token(token, config(namespace: @namespace))
     end
 
@@ -173,6 +178,7 @@ defmodule Electric.Satellite.Auth.InsecureTest do
   end
 
   defp config(opts) do
-    Auth.Insecure.build_config(opts)
+    {:ok, config} = Auth.Insecure.build_config(opts)
+    config
   end
 end

@@ -8,18 +8,9 @@ export const writeSingleFileImportStatements: WriteStatements = (
   dmmf,
   { writer, writeImport }
 ) => {
-  const { prismaClientPath } = dmmf.generatorConfig
   writeImport('{ z }', 'zod')
 
-  // Prisma should primarily be imported as a type, but if there are json fields,
-  // we need to import the whole namespace because the null transformation
-  // relies on the Prisma.JsonNull and Prisma.DbNull objects
-
-  if (dmmf.schema.hasJsonTypes) {
-    writeImport(`{ Prisma }`, `${prismaClientPath}`)
-  } else {
-    writeImport(`type { Prisma }`, `${prismaClientPath}`)
-  }
+  writeImport(`type { Prisma }`, `./prismaClient`)
 
   if (dmmf.customImports) {
     dmmf.customImports.forEach((statement) => {
@@ -27,10 +18,19 @@ export const writeSingleFileImportStatements: WriteStatements = (
     })
   }
 
-  writeImport(
-    `{ TableSchema, DbSchema, Relation, ElectricClient, HKT }`,
-    'electric-sql/client/model'
+  const hasRelations = dmmf.datamodel.models.some(
+    (model) => model.hasRelationFields
   )
+
+  const imports = [
+    'type TableSchema',
+    'DbSchema',
+    ...(hasRelations ? ['Relation'] : []),
+    'ElectricClient',
+    'type HKT',
+  ]
+
+  writeImport(`{ ${imports.join(', ')} }`, 'electric-sql/client/model')
 
   writeImport(`migrations`, './migrations')
 }

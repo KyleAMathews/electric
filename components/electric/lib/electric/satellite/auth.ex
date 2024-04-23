@@ -10,12 +10,13 @@ defmodule Electric.Satellite.Auth do
   require Logger
 
   @enforce_keys [:user_id]
-  defstruct [:user_id]
+  defstruct [:user_id, :expires_at]
 
   @type user_id() :: binary()
 
   @type t() :: %__MODULE__{
-          user_id: user_id()
+          user_id: user_id(),
+          expires_at: non_neg_integer | nil
         }
 
   @type provider() :: {module, map}
@@ -44,33 +45,16 @@ defmodule Electric.Satellite.Auth do
 
   This is a helper function to be used in runtime config.
   """
-  @spec build_provider!(String.t()) :: provider
-  def build_provider!("insecure") do
-    auth_config =
-      [
-        namespace: System.get_env("AUTH_JWT_NAMESPACE")
-      ]
-      |> Auth.Insecure.build_config()
-
-    {Auth.Insecure, auth_config}
+  @spec build_provider(String.t(), keyword) ::
+          {:ok, provider} | {:error, :invalid_auth_mode} | {:error, atom, binary}
+  def build_provider(mode, opts) do
+    with {:ok, module} <- provider_module(mode),
+         {:ok, auth_config} <- module.build_config(opts) do
+      {:ok, {module, auth_config}}
+    end
   end
 
-  def build_provider!("secure") do
-    auth_config =
-      [
-        alg: System.get_env("AUTH_JWT_ALG"),
-        key: System.get_env("AUTH_JWT_KEY"),
-        namespace: System.get_env("AUTH_JWT_NAMESPACE"),
-        iss: System.get_env("AUTH_JWT_ISS"),
-        aud: System.get_env("AUTH_JWT_AUD")
-      ]
-      |> Enum.filter(fn {_, val} -> is_binary(val) and String.trim(val) != "" end)
-      |> Auth.Secure.build_config!()
-
-    {Auth.Secure, auth_config}
-  end
-
-  def build_prodiver!(other) do
-    raise "Unsupported auth mode: #{inspect(other)}"
-  end
+  defp provider_module("insecure"), do: {:ok, Auth.Insecure}
+  defp provider_module("secure"), do: {:ok, Auth.Secure}
+  defp provider_module(_), do: {:error, :invalid_auth_mode}
 end

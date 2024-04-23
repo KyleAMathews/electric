@@ -24,7 +24,8 @@ defmodule Electric.Satellite.SerializationTest do
         "id" => uuid,
         "date" => "2024-12-24",
         "time" => "12:01:00.123",
-        "bool" => "t"
+        "bool" => "t",
+        "blob" => "\\x0001ff"
       }
 
       columns = [
@@ -37,7 +38,8 @@ defmodule Electric.Satellite.SerializationTest do
         %{name: "real", type: :float8},
         %{name: "date", type: :date},
         %{name: "time", type: :time},
-        %{name: "bool", type: :bool}
+        %{name: "bool", type: :bool},
+        %{name: "blob", type: :bytea}
       ]
 
       assert %SatOpRow{
@@ -51,7 +53,8 @@ defmodule Electric.Satellite.SerializationTest do
                  "-3.14",
                  "2024-12-24",
                  "12:01:00.123",
-                 "t"
+                 "t",
+                 <<0, 1, 255>>
                ],
                nulls_bitmask: <<0b11000000, 0>>
              } == Serialization.map_to_row(data, columns)
@@ -79,16 +82,51 @@ defmodule Electric.Satellite.SerializationTest do
                nulls_bitmask: <<0>>
              } == Serialization.map_to_row(data, columns)
     end
+
+    test "converts bytea values from encoded format to raw" do
+      data = %{
+        "blob" => "\\x0001ff",
+        "empty_blob" => "\\x",
+        "null_blob" => nil
+      }
+
+      columns = [
+        %{name: "blob", type: :bytea},
+        %{name: "empty_blob", type: :bytea},
+        %{name: "null_blob", type: :bytea}
+      ]
+
+      assert %SatOpRow{
+               values: [
+                 <<0, 1, 255>>,
+                 <<>>,
+                 <<>>
+               ],
+               nulls_bitmask: <<0b00100000>>
+             } == Serialization.map_to_row(data, columns)
+
+      # Escape formatting not yet supported
+      try do
+        Serialization.map_to_row(%{"escape_blob" => "\\000\\047"}, [
+          %{name: "escape_blob", type: :bytea}
+        ])
+      rescue
+        _ -> :ok
+      else
+        val -> flunk("Expected map_to_row() to raise but it returned #{inspect(val)}")
+      end
+    end
   end
 
   describe "decode_record!" do
     test "decodes a SatOpRow struct into a map" do
       row = %SatOpRow{
-        nulls_bitmask: <<0b00100001, 0>>,
+        nulls_bitmask: <<0b00100000, 0b10000000>>,
         values: [
           "256",
           "hello",
           "",
+          <<0, 1, 255, 174>>,
           "5.4",
           "-1.0e124",
           "2023-08-15 17:20:31",
@@ -104,6 +142,7 @@ defmodule Electric.Satellite.SerializationTest do
         %{name: "int", type: :int2},
         %{name: "text", type: :text},
         %{name: "null", type: :bytea},
+        %{name: "blob", type: :bytea},
         %{name: "real1", type: :float8},
         %{name: "real2", type: :float8},
         %{name: "t", type: :timestamp},
@@ -118,6 +157,7 @@ defmodule Electric.Satellite.SerializationTest do
                "int" => "256",
                "text" => "hello",
                "null" => nil,
+               "blob" => "\\x0001ffae",
                "real1" => "5.4",
                "real2" => "-1.0e124",
                "t" => "2023-08-15 17:20:31",
@@ -145,11 +185,11 @@ defmodule Electric.Satellite.SerializationTest do
 
       columns = [
         %{name: "f1", type: :float8},
-        %{name: "f2", type: :float8},
+        %{name: "f2", type: :float4},
         %{name: "f3", type: :float8},
-        %{name: "f4", type: :float8},
+        %{name: "f4", type: :float4},
         %{name: "f5", type: :float8},
-        %{name: "f6", type: :float8},
+        %{name: "f6", type: :float4},
         %{name: "f7", type: :float8}
       ]
 
@@ -167,9 +207,11 @@ defmodule Electric.Satellite.SerializationTest do
     test "raises when the row contains an invalid value for its type" do
       test_data = [
         {"1.0", :int4},
+        {"-.1", :float4},
         {"33.", :float8},
         {"1000000", :int2},
         {"-1000000000000000", :int4},
+        {"999_000_999_000_999", :int8},
         {"...", :uuid},
         {"00000000-0000-0000-0000-00000000000g", :uuid},
         {"00000000-0000-0000-0000_000000000001", :uuid},
@@ -206,7 +248,9 @@ defmodule Electric.Satellite.SerializationTest do
         {"false", :bool},
         {"yes", :bool},
         {"no", :bool},
-        {"-1", :bool}
+        {"-1", :bool},
+        {"...", :jsonb},
+        {"{[}]", :jsonb}
       ]
 
       Enum.each(test_data, fn {val, type} ->
@@ -344,7 +388,7 @@ defmodule Electric.Satellite.SerializationTest do
             {[], schema}
         end)
 
-      assert {:ok, _} = SchemaCache.save(cxt.origin, version, schema, stmts)
+      assert {:ok, _, _} = SchemaCache.save(cxt.origin, version, schema, stmts)
 
       tx
     end
@@ -506,7 +550,7 @@ defmodule Electric.Satellite.SerializationTest do
 
       {oplog, [], %{}} = Serialization.serialize_trans(tx, 1, %{})
 
-      assert [] == oplog
+      assert [%{ops: [%{op: {:begin, _}}, %{op: {:commit, _}}]}] = oplog
     end
 
     test "writes to tables in electric schema are not serialized", cxt do
@@ -559,7 +603,7 @@ defmodule Electric.Satellite.SerializationTest do
 
       {oplog, [], %{}} = Serialization.serialize_trans(tx, 1, %{})
 
-      assert [] = oplog
+      assert [%{ops: [%{op: {:begin, _}}, %{op: {:commit, _}}]}] = oplog
     end
   end
 end

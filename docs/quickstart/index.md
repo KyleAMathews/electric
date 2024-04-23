@@ -23,7 +23,7 @@ If you'd prefer to understand a bit more about the system before jumping into co
 
 ## Setup
 
-Get setup quickly using the [`create-electric-app`](../api/generator.md) starter app. Or install, run and integrate the components yourself.
+Get setup quickly using the `create-electric-app` starter template. Or install, run and integrate the components yourself.
 
 <Tabs groupId="setup" queryString>
   <TabItem value="generator" label="Use the starter">
@@ -40,6 +40,8 @@ The next section goes over the basics of using ElectricSQL. It's a quick summary
 
 ### Define your schema
 
+ElectricSQL works on top of Postgres. You define and evolve the Postgres database schema using your normal migrations tooling.
+
 <Tabs groupId="setup">
   <TabItem value="generator" label="Generator" attributes={{className: 'hidden'}}>
     <div className="-mt-4">
@@ -52,6 +54,8 @@ The next section goes over the basics of using ElectricSQL. It's a quick summary
     </div>
   </TabItem>
 </Tabs>
+
+See <DocPageLink path="usage/data-modelling/migrations" /> and <DocPageLink path="integrations/backend" /> for more information.
 
 ### Expose data
 
@@ -70,18 +74,6 @@ ELECTRIC GRANT ALL
   TO ANYONE;
 ```
 
-### Authenticate
-
-[Authenticate](../usage/auth/index.md) the local app with the replication protocol using a JSON Web Token:
-
-```tsx
-const config = {
-  auth: {
-    token: '<your JWT>'
-  }
-}
-```
-
 ### Instantiate
 
 Wrap your [SQLite driver](../integrations/drivers/index.md) with a type-safe, schema-aware [database Client](../usage/data-access/client.md):
@@ -90,8 +82,19 @@ Wrap your [SQLite driver](../integrations/drivers/index.md) with a type-safe, sc
 import { electrify, ElectricDatabase } from 'electric-sql/wa-sqlite'
 import { schema } from './generated/client'
 
-const conn = await ElectricDatabase.init('my.db', '')
-const { db } = await electrify(conn, schema, config)
+const config = {
+  url: "http://localhost:5133"
+}
+const conn = await ElectricDatabase.init('my.db')
+const electric = await electrify(conn, schema, config)
+```
+
+### Connect and authenticate
+
+Connect to Electric and [authenticate](../usage/auth/index.md) the local app with the replication protocol using a JSON Web Token:
+
+```tsx
+await electric.connect('<your JWT>')
 ```
 
 ### Sync data
@@ -99,6 +102,7 @@ const { db } = await electrify(conn, schema, config)
 Sync data into the local database using [Shapes](../usage/data-access/shapes.md):
 
 ```tsx
+const db = electric.db
 const shape = await db.items.sync({
   where: {
     // ... clauses
@@ -134,7 +138,7 @@ Either using the [Prisma-inspired client](../usage/data-access/queries.md) or if
 
 ```tsx
 const { results } = useLiveQuery(
-  db.liveRaw({
+  db.liveRawQuery({
     sql: 'SELECT * FROM items where foo = ?',
     args: ['bar']
   })

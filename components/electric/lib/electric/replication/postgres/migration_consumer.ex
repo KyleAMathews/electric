@@ -4,25 +4,23 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
   """
   use GenStage
 
-  alias Electric.Telemetry.Metrics
-  alias Electric.Replication.Connectors
-
-  alias Electric.Replication.Changes.{
-    NewRecord,
-    Transaction,
-    Relation
-  }
+  import Electric.Postgres.Extension, only: [is_ddl_relation: 1, is_extension_relation: 1]
 
   alias Electric.Postgres.{
     Extension,
     Extension.SchemaLoader,
     Extension.SchemaCache,
+    OidDatabase,
     Schema
   }
 
-  require Logger
+  alias Electric.Replication.Changes.{NewRecord, Transaction}
+  alias Electric.Replication.Connectors
+  alias Electric.Replication.Postgres.Client
 
-  import Electric.Postgres.Extension, only: [is_ddl_relation: 1, is_extension_relation: 1]
+  alias Electric.Telemetry.Metrics
+
+  require Logger
 
   @spec name(Connectors.config()) :: Electric.reg_name()
   def name(conn_config) when is_list(conn_config) do
@@ -71,7 +69,9 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
       producer: producer,
       loader: loader,
       opts: opts,
-      refresh_subscription: refresh_sub?
+      refresh_subscription: refresh_sub?,
+      refresh_enum_types: Keyword.get(opts, :refresh_enum_types, true),
+      conn_opts: Connectors.get_connection_opts(conn_config)
     }
 
     {:producer_consumer, state}
@@ -91,14 +91,12 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
   end
 
   @impl GenStage
-  def handle_events(events, _from, state) do
-    {:noreply, filter_transactions(events), process_relations_and_migrations(events, state)}
+  def handle_events(transactions, _from, state) do
+    {:noreply, filter_transactions(transactions), process_migrations(transactions, state)}
   end
 
-  defp filter_transactions(events) do
-    for event <- events, not match?(%Relation{}, event) do
-      filter_transaction(event)
-    end
+  defp filter_transactions(transactions) do
+    Enum.map(transactions, &filter_transaction/1)
   end
 
   # FIXME: we need this to prevent extension metadata tables from being
@@ -114,11 +112,6 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
           Logger.debug("---- Filtering #{inspect(change)}")
           false
 
-        # TODO: VAX-680 remove this special casing of schema_migrations table
-        # once we are selectivley replicating tables
-        %{relation: {"public", "schema_migrations"}} ->
-          false
-
         _change ->
           true
       end)
@@ -130,40 +123,28 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
     change
   end
 
-  defp process_relations_and_migrations(events, state) do
-    grouped_events = Enum.group_by(events, & &1.__struct__)
+  defp process_migrations(transactions, %{loader: loader} = state) do
+    {:ok, %{version: schema_version}} = SchemaLoader.load(loader)
 
-    state
-    |> apply_relations(Map.get(grouped_events, Relation, []))
-    |> apply_migrations(Map.get(grouped_events, Transaction, []))
+    {state, num_applied_migrations} =
+      transactions
+      |> transactions_to_migrations(state)
+      |> skip_applied_migrations(schema_version)
+      |> Enum.reduce({state, 0}, fn migration, {state, num_applied} ->
+        {perform_migration(migration, state), num_applied + 1}
+      end)
+
+    if num_applied_migrations > 0 do
+      refresh_subscription(state)
+    else
+      state
+    end
   end
 
-  defp apply_relations(state, relations) do
-    Enum.reduce(relations, state, &process_relation/2)
-  end
-
-  defp apply_migrations(state, transactions) do
+  defp transactions_to_migrations(transactions, state) do
     transactions
     |> Enum.flat_map(&transaction_changes_to_migrations(&1, state))
     |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-    |> Enum.reduce(state, &perform_migration/2)
-  end
-
-  defp process_relation(%Relation{} = _relation, state) do
-    refresh_subscription(state)
-  end
-
-  # update the subscription to add any new
-  # tables (this only works when data has been added -- doing it at the
-  # point of receiving the migration has no effect).
-  defp refresh_subscription(%{refresh_subscription: false} = state) do
-    state
-  end
-
-  defp refresh_subscription(state) do
-    Logger.debug("#{__MODULE__} refreshing subscription '#{state.subscription}'")
-    :ok = SchemaLoader.refresh_subscription(state.loader, state.subscription)
-    state
   end
 
   defp transaction_changes_to_migrations(%Transaction{changes: changes}, state) do
@@ -174,18 +155,32 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
     end
   end
 
-  defp perform_migration({version, stmts}, state) do
-    {:ok, loader} = apply_migration(version, stmts, state.loader)
+  defp skip_applied_migrations(migrations, schema_version) do
+    Enum.drop_while(migrations, fn {version, _stmts} -> version <= schema_version end)
+  end
 
-    {:ok, table_count} = SchemaLoader.count_electrified_tables(loader)
+  defp perform_migration({version, stmts}, state) do
+    {:ok, loader, schema_version} = apply_migration(version, stmts, state)
 
     Metrics.non_span_event(
       [:postgres, :migration],
-      %{electrified_tables: table_count},
+      %{electrified_tables: Schema.num_electrified_tables(schema_version.schema)},
       %{migration_version: version}
     )
 
-    refresh_subscription(%{state | loader: loader})
+    %{state | loader: loader}
+  end
+
+  # update the subscription to add any new
+  # tables (this only works when data has been added -- doing it at the
+  # point of receiving the migration has no effect).
+  defp refresh_subscription(%{refresh_subscription: refresh?} = state) do
+    if refresh? do
+      Logger.debug("#{__MODULE__} refreshing subscription '#{state.subscription}'")
+      :ok = SchemaLoader.refresh_subscription(state.loader, state.subscription)
+    end
+
+    state
   end
 
   @impl GenStage
@@ -221,17 +216,19 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
   Apply a migration, composed of a version and a list of DDL statements, to a schema
   using the given implementation of SchemaLoader.
   """
-  @spec apply_migration(String.t(), [String.t()], SchemaLoader.t()) ::
-          {:ok, SchemaLoader.t()} | {:error, term()}
-  def apply_migration(version, stmts, loader) when is_list(stmts) do
-    {:ok, old_version, schema} = SchemaLoader.load(loader)
+  @spec apply_migration(String.t(), [String.t()], map) ::
+          {:ok, SchemaLoader.t(), SchemaLoader.Version.t()} | {:error, term()}
+  def apply_migration(version, stmts, %{loader: loader} = state) when is_list(stmts) do
+    {:ok, %{schema: schema} = schema_version} = SchemaLoader.load(loader)
 
-    Logger.info("Migrating version #{old_version || "<nil>"} -> #{version}")
+    Logger.info("Migrating version #{schema_version.version || "<nil>"} -> #{version}")
 
     oid_loader = &SchemaLoader.relation_oid(loader, &1, &2, &3)
 
+    old_enums = schema.enums
+
     schema =
-      Enum.reduce(stmts, schema, fn stmt, schema ->
+      Enum.reduce(stmts, schema_version.schema, fn stmt, schema ->
         Logger.info("Applying migration #{version}: #{inspect(stmt)}")
         Schema.update(schema, stmt, oid_loader: oid_loader)
       end)
@@ -239,6 +236,12 @@ defmodule Electric.Replication.Postgres.MigrationConsumer do
 
     Logger.info("Saving schema version #{version} /#{inspect(loader)}/")
 
-    {:ok, _loader} = SchemaLoader.save(loader, version, schema, stmts)
+    {:ok, loader, schema_version} = SchemaLoader.save(loader, version, schema, stmts)
+
+    if state.refresh_enum_types and schema.enums != old_enums do
+      Client.with_conn(state.conn_opts, fn conn -> OidDatabase.update_oids(conn, [:ENUM]) end)
+    end
+
+    {:ok, loader, schema_version}
   end
 end

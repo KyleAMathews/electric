@@ -3,8 +3,8 @@ defmodule Electric.Satellite.Auth.Secure do
   Implementation module of the "secure" auth mode.
 
   This mode requires auth tokens to be signed. It also checks for the presence of at least "iat" and "exp" claims. If
-  you include values for "iss" and/or "aud" claims in your configuration, those will also be enforced. The "user_id"
-  claims must also be present, either at the top level or under a configurable namespace.
+  you include values for "iss" and/or "aud" claims in your configuration, those will also be enforced. A "sub" or
+  "user_id" claim must also be present, either at the top level or under a configurable namespace.
 
   Auth tokens must use the same signing algorithm as the one configured in Electric.
 
@@ -13,10 +13,7 @@ defmodule Electric.Satellite.Auth.Secure do
 
   @behaviour Electric.Satellite.Auth
 
-  import Joken, only: [current_time: 0]
-
   alias Electric.Satellite.Auth
-  alias Electric.Satellite.Auth.ConfigError
   alias Electric.Satellite.Auth.JWTUtil
 
   require Logger
@@ -24,8 +21,7 @@ defmodule Electric.Satellite.Auth.Secure do
   # 15 mins
   @token_max_age 60 * 15
 
-  defguardp supported_signing_alg?(alg)
-            when alg in ~w[HS256 HS384 HS512 RS256 RS384 RS512 ES256 ES384 ES512]
+  @supported_signing_algs ~w[HS256 HS384 HS512 RS256 RS384 RS512 ES256 ES384 ES512]
 
   @doc ~S"""
   Validate configuration options and build a clean config for "secure" auth.
@@ -45,8 +41,10 @@ defmodule Electric.Satellite.Auth.Secure do
 
          "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQY..."
 
-    * `namespace: <string>` - optional namespace under which the "user_id" claim will be looked up. If omitted,
-      "user_id" must be a top-level claim.
+    * `key_is_base64_encoded: <boolean>` - optional flag that indicates whether the key should be base64-decoded.
+
+    * `namespace: <string>` - optional namespace under which the "sub" or "user_id" claim will be looked up. If omitted,
+      "sub" or "user_id" must be a top-level claim.
 
     * `iss: <string>` - optional issuer string to check all auth tokens with. If this is configured, JWTs without an
       "iss" claim will be considered invalid.
@@ -54,74 +52,120 @@ defmodule Electric.Satellite.Auth.Secure do
     * `aud: <string>` - optional audience string to check all auth tokens with. If this is configured, JWTs without an
       "aud" claim will be considered invalid.
   """
-  @spec build_config!(Access.t()) :: map
-  def build_config!(opts) do
-    alg =
-      case opts[:alg] do
-        alg when is_binary(alg) and supported_signing_alg?(alg) ->
-          alg
+  @spec build_config(keyword) :: {:ok, map} | {:error, atom, binary}
+  def build_config(opts) do
+    with {:ok, alg} <- validate_alg(opts),
+         {:ok, key} <- validate_key(alg, opts) do
+      token_config =
+        %{}
+        |> Joken.Config.add_claim("iat", &JWTUtil.gen_timestamp/0, &JWTUtil.past_timestamp?/1)
+        |> Joken.Config.add_claim("nbf", &JWTUtil.gen_timestamp/0, &JWTUtil.past_timestamp?/1)
+        |> add_exp_claim(in: @token_max_age)
+        |> maybe_add_claim("iss", opts[:iss])
+        |> maybe_add_claim("aud", opts[:aud])
 
-        _ ->
-          raise ConfigError, "Missing or invalid 'alg' configuration option for secure auth mode"
-      end
+      required_claims =
+        ["iat", "exp", opts[:iss] && "iss", opts[:aud] && "aud"]
+        |> Enum.reject(&is_nil/1)
 
-    key =
-      if key = opts[:key] do
-        key
-        |> validate_key(alg)
-        |> prepare_key(alg)
-      else
-        raise ConfigError, "Missing 'key' configuration option for secure auth mode"
-      end
-
-    token_config =
-      %{}
-      # Subtracting one second from generated "iat" and "nbf" claims is necessary for tests to pass.
-      |> Joken.Config.add_claim("iat", fn -> current_time() - 1 end, &(&1 < current_time()))
-      |> Joken.Config.add_claim("nbf", fn -> current_time() - 1 end, &(&1 < current_time()))
-      |> add_exp_claim(in: @token_max_age)
-      |> maybe_add_claim("iss", opts[:iss])
-      |> maybe_add_claim("aud", opts[:aud])
-
-    required_claims =
-      ["iat", "exp", opts[:iss] && "iss", opts[:aud] && "aud"]
-      |> Enum.reject(&is_nil/1)
-
-    %{
-      alg: alg,
-      namespace: opts[:namespace],
-      joken_signer: Joken.Signer.create(alg, key),
-      joken_config: token_config,
-      required_claims: required_claims
-    }
+      {:ok,
+       %{
+         alg: alg,
+         namespace: opts[:namespace],
+         joken_signer: Joken.Signer.create(alg, key),
+         joken_config: token_config,
+         required_claims: required_claims
+       }}
+    end
   end
 
-  defp validate_key(key, "HS256") when byte_size(key) < 32,
-    do: raise(ConfigError, "The 'key' needs to be at least 32 bytes long for HS256")
+  defp validate_alg(opts) do
+    case opts[:alg] do
+      alg when is_binary(alg) and alg in @supported_signing_algs ->
+        {:ok, alg}
 
-  defp validate_key(key, "HS384") when byte_size(key) < 48,
-    do: raise(ConfigError, "The 'key' needs to be at least 48 bytes long for HS384")
+      nil ->
+        {:error, :alg, "not set"}
 
-  defp validate_key(key, "HS512") when byte_size(key) < 64,
-    do: raise(ConfigError, "The 'key' needs to be at least 64 bytes long for HS512")
+      other ->
+        {:error, :alg,
+         "has invalid value: #{inspect(other)}. Must be one of #{inspect(@supported_signing_algs)}"}
+    end
+  end
 
-  defp validate_key(key, _alg), do: key
+  defp validate_key(alg, opts) when is_binary(alg) and is_list(opts) do
+    if key = opts[:key] do
+      validate_key(key, alg, opts)
+    else
+      {:error, :key, "not set"}
+    end
+  end
 
-  defp prepare_key(raw_key, "HS" <> _), do: raw_key
-  defp prepare_key(raw_key, "RS" <> _), do: %{"pem" => raw_key}
-  defp prepare_key(raw_key, "ES" <> _), do: %{"pem" => raw_key}
+  defp validate_key(maybe_encoded_key, "HS" <> _ = alg, opts) do
+    with {:ok, key} <- decode_key(maybe_encoded_key, opts) do
+      validate_key_length(key, alg)
+    end
+  end
 
-  defp add_exp_claim(token_config, in: seconds),
-    do:
-      Joken.Config.add_claim(
-        token_config,
-        "exp",
-        fn -> current_time() + seconds end,
-        &(&1 > current_time())
-      )
+  defp validate_key(key, pk_alg, _opts) do
+    algorithms_for_key =
+      key
+      |> JOSE.JWK.from_pem()
+      |> JOSE.JWK.verifier()
 
-  defp add_exp_claim(token_config, at: unix_time),
-    do: Joken.Config.add_claim(token_config, "exp", fn -> unix_time end, &(&1 > current_time()))
+    if pk_alg in algorithms_for_key do
+      {:ok, %{"pem" => key}}
+    else
+      {:error, :key,
+       """
+       is not a valid key for AUTH_JWT_ALG=#{pk_alg} or it has invalid format.
+
+           The key for RS* and ES* algorithms must use the PEM format, with the header
+           and footer included:
+
+               -----BEGIN PUBLIC KEY-----
+               MFkwEwYHKoZIzj0CAQY...
+               ...
+               -----END PUBLIC KEY-----
+       """}
+    end
+  end
+
+  defp validate_key_length(raw_key, "HS256") when byte_size(raw_key) < 32,
+    do: {:error, :key, "has to be at least 32 bytes long for HS256"}
+
+  defp validate_key_length(raw_key, "HS384") when byte_size(raw_key) < 48,
+    do: {:error, :key, "has to be at least 48 bytes long for HS384"}
+
+  defp validate_key_length(raw_key, "HS512") when byte_size(raw_key) < 64,
+    do: {:error, :key, "has to be at least 64 bytes long for HS512"}
+
+  defp validate_key_length(raw_key, "HS" <> _), do: {:ok, raw_key}
+
+  defp decode_key(maybe_encoded_key, opts) do
+    if opts[:key_is_base64_encoded] do
+      # The `padding: false` is required to accept keys that are base64-encoded without padding.
+      case Base.decode64(maybe_encoded_key, padding: false) do
+        {:ok, key} -> {:ok, key}
+        :error -> {:error, :key, "has invalid base64 encoding"}
+      end
+    else
+      {:ok, maybe_encoded_key}
+    end
+  end
+
+  defp add_exp_claim(token_config, in: seconds) do
+    Joken.Config.add_claim(
+      token_config,
+      "exp",
+      fn -> JWTUtil.gen_timestamp(seconds) end,
+      &JWTUtil.future_timestamp?/1
+    )
+  end
+
+  defp add_exp_claim(token_config, at: unix_time) do
+    Joken.Config.add_claim(token_config, "exp", fn -> unix_time end, &JWTUtil.future_timestamp?/1)
+  end
 
   defp maybe_add_claim(token_config, _claim, nil), do: token_config
 
@@ -133,7 +177,7 @@ defmodule Electric.Satellite.Auth.Secure do
     with {:ok, claims} <- verify_and_decode(token, config),
          :ok <- validate_claims(claims, config),
          {:ok, user_id} <- JWTUtil.fetch_user_id(claims, config.namespace) do
-      {:ok, %Auth{user_id: user_id}}
+      {:ok, %Auth{user_id: user_id, expires_at: claims["exp"]}}
     else
       {:error, reason} -> {:error, JWTUtil.translate_error_reason(reason)}
     end

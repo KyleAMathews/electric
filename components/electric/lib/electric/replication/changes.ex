@@ -24,6 +24,7 @@ defmodule Electric.Replication.Changes do
   (UUID for Satellite clients) and timestamp is millisecond-precision UTC unix timestamp
   """
   @type tag() :: String.t()
+  @type pk() :: [String.t(), ...]
 
   @type change() ::
           Changes.NewRecord.t()
@@ -33,16 +34,23 @@ defmodule Electric.Replication.Changes do
   defmodule Transaction do
     alias Electric.Replication.Changes
 
+    @type referenced_records :: %{
+            optional(Changes.relation()) => %{
+              optional(Changes.pk()) => Changes.ReferencedRecord.t()
+            }
+          }
+
     @type t() :: %__MODULE__{
             xid: non_neg_integer() | nil,
             changes: [Changes.change()],
+            referenced_records: referenced_records(),
             commit_timestamp: DateTime.t(),
             origin: String.t(),
             # this field is only set by Electric
             origin_type: :postgresql | :satellite,
             publication: String.t(),
             lsn: Electric.Postgres.Lsn.t(),
-            ack_fn: (-> :ok | {:error, term()})
+            additional_data_ref: non_neg_integer()
           }
 
     defstruct [
@@ -52,12 +60,30 @@ defmodule Electric.Replication.Changes do
       :origin,
       :publication,
       :lsn,
-      :ack_fn,
-      :origin_type
+      :origin_type,
+      referenced_records: %{},
+      additional_data_ref: 0
     ]
 
+    @spec count_operations(t()) :: %{
+            operations: non_neg_integer(),
+            inserts: non_neg_integer(),
+            updates: non_neg_integer(),
+            deletes: non_neg_integer(),
+            compensations: non_neg_integer(),
+            truncates: non_neg_integer(),
+            gone: non_neg_integer()
+          }
     def count_operations(%__MODULE__{changes: changes}) do
-      base = %{operations: 0, inserts: 0, updates: 0, deletes: 0}
+      base = %{
+        operations: 0,
+        inserts: 0,
+        updates: 0,
+        deletes: 0,
+        compensations: 0,
+        truncates: 0,
+        gone: 0
+      }
 
       Enum.reduce(changes, base, fn %module{}, acc ->
         key =
@@ -65,12 +91,25 @@ defmodule Electric.Replication.Changes do
             Changes.NewRecord -> :inserts
             Changes.UpdatedRecord -> :updates
             Changes.DeletedRecord -> :deletes
+            Changes.Compensation -> :compensations
+            Changes.TruncatedRelation -> :truncates
+            Changes.Gone -> :gone
           end
 
-        %{^key => value, :operations => total} = acc
-
-        %{acc | key => value + 1, :operations => total + 1}
+        Map.update!(%{acc | operations: acc.operations + 1}, key, &(&1 + 1))
       end)
+    end
+
+    @spec add_referenced_record(t(), Changes.ReferencedRecord.t()) :: t()
+    def add_referenced_record(
+          %__MODULE__{} = txn,
+          %{relation: rel, pk: pk} = referenced
+        )
+        when is_struct(referenced, Changes.ReferencedRecord) do
+      updated =
+        Map.update(txn.referenced_records, rel, %{pk => referenced}, &Map.put(&1, pk, referenced))
+
+      %__MODULE__{txn | referenced_records: updated}
     end
   end
 
@@ -85,14 +124,46 @@ defmodule Electric.Replication.Changes do
   end
 
   defmodule UpdatedRecord do
-    defstruct [:relation, :old_record, :record, tags: []]
+    defstruct [:relation, :old_record, :record, tags: [], changed_columns: MapSet.new()]
 
     @type t() :: %__MODULE__{
             relation: Changes.relation(),
             old_record: Changes.record() | nil,
             record: Changes.record(),
-            tags: [Changes.tag()]
+            tags: [Changes.tag()],
+            changed_columns: MapSet.t()
           }
+
+    def new(attrs) do
+      __MODULE__
+      |> struct(attrs)
+      |> build_changed_columns()
+    end
+
+    defp build_changed_columns(%{old_record: nil} = change) do
+      change
+    end
+
+    defp build_changed_columns(change) do
+      %{old_record: old, record: new} = change
+
+      # if the value is in the new but NOT the old, then it's being updated
+      # if it's in the old but NOT the new, then it's staying the same
+      changed =
+        Enum.reduce(new, MapSet.new(), fn {col_name, new_value}, changed ->
+          case Map.fetch(old, col_name) do
+            :error ->
+              MapSet.put(changed, col_name)
+
+            {:ok, old_value} ->
+              if old_value == new_value,
+                do: changed,
+                else: MapSet.put(changed, col_name)
+          end
+        end)
+
+      %{change | changed_columns: changed}
+    end
   end
 
   defmodule DeletedRecord do
@@ -102,6 +173,36 @@ defmodule Electric.Replication.Changes do
             relation: Changes.relation(),
             old_record: Changes.record(),
             tags: [Changes.tag()]
+          }
+  end
+
+  defmodule Compensation do
+    defstruct [:relation, :record, tags: []]
+
+    @type t() :: %__MODULE__{
+            relation: Changes.relation(),
+            record: Changes.record(),
+            tags: [Changes.tag()]
+          }
+  end
+
+  defmodule ReferencedRecord do
+    defstruct [:relation, :record, :pk, tags: []]
+
+    @type t() :: %__MODULE__{
+            relation: Changes.relation(),
+            record: Changes.record(),
+            pk: Changes.pk(),
+            tags: [Changes.tag()]
+          }
+  end
+
+  defmodule Gone do
+    defstruct [:relation, :pk]
+
+    @type t() :: %__MODULE__{
+            relation: Changes.relation(),
+            pk: Changes.pk()
           }
   end
 
@@ -119,50 +220,13 @@ defmodule Electric.Replication.Changes do
     origin <> "@" <> Integer.to_string(DateTime.to_unix(tm, :millisecond))
   end
 
-  defmodule Relation.Column do
-    defstruct [:flags, :name, :type, :type_modifier, :primary_key]
-
-    @type t() :: %__MODULE__{
-            flags: [:key],
-            name: String.t(),
-            type: atom(),
-            type_modifier: integer()
-          }
+  def convert_update(%UpdatedRecord{} = change, to: :new_record) do
+    %NewRecord{relation: change.relation, tags: change.tags, record: change.record}
   end
 
-  defmodule Relation do
-    alias Electric.Postgres.Replication.{Table, Column}
-
-    defstruct [:id, :namespace, :name, :replica_identity, :columns]
-
-    @type t() :: %__MODULE__{
-            id: Changes.relation_id(),
-            namespace: String.t(),
-            name: String.t(),
-            replica_identity: :default | :nothing | :all_columns | :index,
-            columns: [Relation.Column.t()]
-          }
-
-    # Convert a Relation message into a table structure as used by the SchemaRegistry
-    @spec to_schema_table(t()) :: Table.t()
-    def to_schema_table(%__MODULE__{} = relation) do
-      %Table{
-        name: relation.name,
-        schema: relation.namespace,
-        oid: relation.id,
-        replica_identity: relation.replica_identity,
-        primary_keys: [],
-        columns:
-          Enum.map(
-            relation.columns,
-            &%Column{
-              name: &1.name,
-              part_of_identity?: :key in &1.flags,
-              type: &1.type,
-              type_modifier: &1.type_modifier
-            }
-          )
-      }
-    end
+  def convert_update(%UpdatedRecord{} = change, to: :deleted_record) do
+    %DeletedRecord{relation: change.relation, tags: change.tags, old_record: change.old_record}
   end
+
+  def convert_update(%UpdatedRecord{} = change, to: :updated_record), do: change
 end

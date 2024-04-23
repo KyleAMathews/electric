@@ -10,24 +10,13 @@
 
 [shell proxy_1]
     [invoke migrate_items_table 001]
-
-    [local sql=
-        """
-        CREATE TABLE public.other_items (
-            id TEXT PRIMARY KEY,
-            content TEXT NOT NULL,
-            item_id UUID REFERENCES public.items(id)
-        );
-        ALTER TABLE public.other_items ENABLE ELECTRIC;
-        """]
-    [invoke migrate_pg 002 $sql]
+    [invoke migrate_other_items_table 002]
 
 [shell satellite_1]
     ??[rpc] recv: #SatInStartReplicationResp
-    [invoke node_await_table "other_items"]
-    [invoke node_sync_table "other_items"]
+    [invoke node_sync_other_items ""]
     ??[proto] recv: #SatSubsDataEnd
-    !await db.db.raw({sql: "UPDATE _electric_meta SET value = 1 WHERE key = 'compensations' RETURNING *"})
+    !await db.db.unsafeExec({sql: "UPDATE _electric_meta SET value = 1 WHERE key = 'compensations' RETURNING *"})
     ?$node
 
     """!await db.db.items.create({
@@ -40,9 +29,8 @@
     ??[proto] send: #SatOpLog
     ??[proto] recv: #SatOpLog
 
-# TEST:
     # Disconnect the client
-    !db.notifier.connectivityStateChanged(db.notifier.dbName, 'disconnected')
+    !db.disconnect()
 
 [shell pg_1]
     # Concurrently, update and then delete the referenced row on the server
@@ -65,7 +53,7 @@
 
 [shell satellite_1]
     # Reconnect the client, expecting no errors to show up
-    !db.notifier.connectivityStateChanged(db.notifier.dbName, 'available')
+    !db.connect()
     ??[proto] send: #SatOpLog
     ??[proto] recv: #SatOpLog
 

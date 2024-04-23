@@ -3,28 +3,29 @@ import Database from 'better-sqlite3'
 import { electrify } from '../../src/drivers/better-sqlite3'
 import { schema } from './generated'
 import { MockRegistry } from '../../src/satellite/mock'
+import { EventNotifier } from '../../src/notifiers'
+import { mockElectricClient } from '../satellite/common'
+import { EVENT_NAMES } from '../../src/notifiers/event'
 
 const conn = new Database(':memory:')
-const config = {
-  auth: {
-    token: 'test-token',
-  },
-}
+const config = {}
 
 const { notifier, adapter, db } = await electrify(conn, schema, config, {
   registry: new MockRegistry(),
 })
-await db.Items.sync() // sync the Items table
+await db.Items.sync({ where: 'this.id IN (1, 2, 3)' }) // sync the Items table
 
 async function runAndCheckNotifications(f: () => Promise<void>) {
   let notifications = 0
-  const sub = notifier.subscribeToPotentialDataChanges((_notification) => {
-    notifications = notifications + 1
-  })
+  const unsubscribe = notifier.subscribeToPotentialDataChanges(
+    (_notification) => {
+      notifications = notifications + 1
+    }
+  )
 
   await f()
 
-  notifier.unsubscribeFromPotentialDataChanges(sub)
+  unsubscribe()
   return notifications
 }
 
@@ -212,3 +213,37 @@ test.serial('deleteMany runs potentiallyChanged', async (t) => {
   const notifications = await runAndCheckNotifications(del)
   t.is(notifications, 1)
 })
+
+test.serial(
+  'electrification registers process and unregisters on close thereby releasing resources',
+  async (t) => {
+    const registry = new MockRegistry()
+    const electric = await mockElectricClient(conn, registry)
+
+    // Check that satellite is registered
+    const satellite = electric.satellite
+    t.is(registry.satellites[conn.name], satellite)
+
+    // Check that the listeners are registered
+    const notifier = electric.notifier as EventNotifier
+    const events = [
+      EVENT_NAMES.authChange,
+      EVENT_NAMES.potentialDataChange,
+      EVENT_NAMES.connectivityStateChange,
+    ]
+    events.forEach((eventName) => {
+      t.assert(notifier.events.listenerCount(eventName) > 0)
+    })
+
+    // Close the Electric client
+    await electric.close()
+
+    // Check that the listeners are unregistered
+    events.forEach((eventName) => {
+      t.is(notifier.events.listenerCount(eventName), 0)
+    })
+
+    // Check that the Satellite process is unregistered
+    t.assert(!registry.satellites.hasOwnProperty(conn.name))
+  }
+)

@@ -10,6 +10,7 @@ import { generateTag } from '../../src/satellite/oplog'
 import {
   DataChange,
   DataChangeType,
+  Relation,
   Row,
   SchemaChange,
   Statement,
@@ -28,8 +29,10 @@ const test = testAny as TestFn<CurrentContext>
 
 test.beforeEach(async (t) => {
   await makeContext(t)
-  const { satellite, authState } = t.context
+  const { satellite, authState, token } = t.context
   await satellite.start(authState)
+  satellite.setToken(token)
+  await satellite.connectWithBackoff()
   t.context['clientId'] = satellite._authState!.clientId // store clientId in the context
   await populateDB(t)
   const txDate = await satellite._performSnapshot()
@@ -120,9 +123,21 @@ const createTable: SchemaChange = {
   table: {
     name: 'NewTable',
     columns: [
-      { name: 'id', sqliteType: 'TEXT' },
-      { name: 'foo', sqliteType: 'INTEGER' },
-      { name: 'bar', sqliteType: 'TEXT' },
+      {
+        name: 'id',
+        sqliteType: 'TEXT',
+        pgType: { name: 'TEXT', array: [], size: [] },
+      },
+      {
+        name: 'foo',
+        sqliteType: 'INTEGER',
+        pgType: { name: 'INTEGER', array: [], size: [] },
+      },
+      {
+        name: 'bar',
+        sqliteType: 'TEXT',
+        pgType: { name: 'TEXT', array: [], size: [] },
+      },
     ],
     fks: [],
     pks: ['id'],
@@ -140,10 +155,26 @@ const addColumn: SchemaChange = {
   table: {
     name: 'parent',
     columns: [
-      { name: 'id', sqliteType: 'INTEGER' },
-      { name: 'value', sqliteType: 'TEXT' },
-      { name: 'other', sqliteType: 'INTEGER' },
-      { name: 'baz', sqliteType: 'TEXT' },
+      {
+        name: 'id',
+        sqliteType: 'INTEGER',
+        pgType: { name: 'INTEGER', array: [], size: [] },
+      },
+      {
+        name: 'value',
+        sqliteType: 'TEXT',
+        pgType: { name: 'TEXT', array: [], size: [] },
+      },
+      {
+        name: 'other',
+        sqliteType: 'INTEGER',
+        pgType: { name: 'INTEGER', array: [], size: [] },
+      },
+      {
+        name: 'baz',
+        sqliteType: 'TEXT',
+        pgType: { name: 'TEXT', array: [], size: [] },
+      },
     ],
     fks: [],
     pks: ['id'],
@@ -162,28 +193,28 @@ const addColumnRelation = {
       name: 'id',
       type: 'INTEGER',
       isNullable: false,
-      primaryKey: true,
+      primaryKey: 1,
     },
     {
       name: 'value',
       type: 'TEXT',
       isNullable: true,
-      primaryKey: false,
+      primaryKey: undefined,
     },
     {
       name: 'other',
       type: 'INTEGER',
       isNullable: true,
-      primaryKey: false,
+      primaryKey: undefined,
     },
     {
       name: 'baz',
       type: 'TEXT',
       isNullable: true,
-      primaryKey: false,
+      primaryKey: undefined,
     },
   ],
-}
+} satisfies Relation
 const newTableRelation = {
   id: 2001, // doesn't matter
   schema: 'public',
@@ -194,22 +225,22 @@ const newTableRelation = {
       name: 'id',
       type: 'TEXT',
       isNullable: false,
-      primaryKey: true,
+      primaryKey: 1,
     },
     {
       name: 'foo',
       type: 'INTEGER',
       isNullable: true,
-      primaryKey: false,
+      primaryKey: undefined,
     },
     {
       name: 'bar',
       type: 'TEXT',
       isNullable: true,
-      primaryKey: false,
+      primaryKey: undefined,
     },
   ],
-}
+} satisfies Relation
 
 async function checkMigrationIsApplied(t: ExecutionContext<CurrentContext>) {
   await assertDbHasTables(t, 'parent', 'child', 'NewTable')
@@ -689,7 +720,13 @@ const migrationWithFKs: SchemaChange[] = [
     `,
     table: {
       name: 'test_items',
-      columns: [{ name: 'id', sqliteType: 'TEXT' }],
+      columns: [
+        {
+          name: 'id',
+          sqliteType: 'TEXT',
+          pgType: { name: 'TEXT', array: [], size: [] },
+        },
+      ],
       fks: [],
       pks: ['id'],
     },
@@ -707,8 +744,16 @@ const migrationWithFKs: SchemaChange[] = [
     table: {
       name: 'test_other_items',
       columns: [
-        { name: 'id', sqliteType: 'TEXT' },
-        { name: 'item_id', sqliteType: 'TEXT' },
+        {
+          name: 'id',
+          sqliteType: 'TEXT',
+          pgType: { name: 'TEXT', array: [], size: [] },
+        },
+        {
+          name: 'item_id',
+          sqliteType: 'TEXT',
+          pgType: { name: 'TEXT', array: [], size: [] },
+        },
       ],
       fks: [
         {

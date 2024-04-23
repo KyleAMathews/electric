@@ -10,7 +10,7 @@ import {
 import { UpdateInput, UpdateManyInput } from '../input/updateInput'
 import { DeleteInput, DeleteManyInput } from '../input/deleteInput'
 import { DatabaseAdapter } from '../../electric/adapter'
-import { Builder } from './builder'
+import { Builder, makeFilter } from './builder'
 import { Executor } from '../execution/executor'
 import { BatchPayload } from '../output/batchPayload'
 import { InvalidArgumentError } from '../validation/errors/invalidArgumentError'
@@ -29,7 +29,15 @@ import pick from 'lodash.pick'
 import omitBy from 'lodash.omitby'
 import hasOwn from 'object.hasown'
 import * as z from 'zod'
-import { parseTableNames, Row, Statement } from '../../util'
+import {
+  isPotentiallyDangerous,
+  parseTableNames,
+  Row,
+  Statement,
+  createQueryResultSubscribeFunction,
+  isObject,
+  ReplicatedRowTransformer,
+} from '../../util'
 import { NarrowInclude } from '../input/inputNarrowing'
 import { IShapeManager } from './shapes'
 import { ShapeSubscription } from '../../satellite'
@@ -42,8 +50,12 @@ import {
   transformFindUnique,
   transformUpdate,
   transformUpdateMany,
-  transformUpsert,
 } from '../conversions/input'
+import { Rel, Shape } from '../../satellite/shapes/types'
+import {
+  IReplicationTransformManager,
+  transformTableRecord,
+} from './transforms'
 
 type AnyTable = Table<any, any, any, any, any, any, any, any, any, HKT>
 
@@ -60,6 +72,7 @@ export class Table<
   GetPayload extends HKT
 > implements
     Model<
+      T,
       CreateData,
       UpdateData,
       Select,
@@ -73,7 +86,6 @@ export class Table<
 {
   private _builder: Builder
   private _executor: Executor
-  private _shapeManager: IShapeManager
   private _qualifiedTableName: QualifiedTablename
   private _tables: Map<TableName, AnyTable>
   private _fields: Fields
@@ -96,26 +108,32 @@ export class Table<
   >
   private deleteSchema: z.ZodType<DeleteInput<Select, WhereUnique, Include>>
   private deleteManySchema: z.ZodType<DeleteManyInput<Where>>
-  private syncSchema: z.ZodType<SyncInput<Include>>
+  private syncSchema: z.ZodType<SyncInput<Include, Where>>
 
   constructor(
     public tableName: string,
     adapter: DatabaseAdapter,
-    notifier: Notifier,
-    shapeManager: IShapeManager,
+    private _notifier: Notifier,
+    private _shapeManager: IShapeManager,
+    private _replicationTransformManager: IReplicationTransformManager,
     private _dbDescription: DbSchema<any>
   ) {
     this._fields = this._dbDescription.getFields(tableName)
     const fieldNames = this._dbDescription.getFieldNames(tableName)
-    this._builder = new Builder(tableName, fieldNames, shapeManager)
-    this._executor = new Executor(adapter, notifier, this._fields)
-    this._shapeManager = shapeManager
+    const tableDescription = this._dbDescription.getTableDescription(tableName)
+    this._builder = new Builder(
+      tableName,
+      fieldNames,
+      _shapeManager,
+      tableDescription
+    )
+    this._executor = new Executor(adapter, _notifier, this._fields)
     this._qualifiedTableName = new QualifiedTablename('main', tableName)
     this._tables = new Map()
-    const tableDescription = this._dbDescription.getTableDescription(tableName)
     this._schema = tableDescription.modelSchema
-    this.createSchema = //transformCreateSchema(
-      omitCountFromSelectAndIncludeSchema(tableDescription.createSchema) //, fields)
+    this.createSchema = omitCountFromSelectAndIncludeSchema(
+      tableDescription.createSchema
+    )
     this.createManySchema = tableDescription.createManySchema
     this.findUniqueSchema = tableDescription.findUniqueSchema
     this.findSchema = tableDescription.findSchema
@@ -126,8 +144,18 @@ export class Table<
     this.upsertSchema = tableDescription.upsertSchema
     this.deleteSchema = tableDescription.deleteSchema
     this.deleteManySchema = tableDescription.deleteManySchema
+
+    // TODO: The syncSchema currently allows too much
+    //       modify the `where` clause of the schema to allow only the fields
+    //       (no nested relation fields)
+    //       and also change the field types to expect the value type and no nested filter schema allowed
     this.syncSchema = (tableDescription.findSchema as z.AnyZodObject).pick({
       include: true,
+    })
+    const shape = (tableDescription.findSchema as z.AnyZodObject).shape.where
+
+    this.syncSchema = (this.syncSchema as any).extend({
+      where: shape.or(z.string().optional()),
     })
   }
 
@@ -135,7 +163,57 @@ export class Table<
     this._tables = tables
   }
 
-  protected getIncludedTables<T extends SyncInput<Include>>(
+  protected computeShape<T extends SyncInput<Include, Where>>(i: T): Shape {
+    // Recursively go over the included fields
+    const include = i.include ?? {}
+    const where = i.where ?? ''
+    const includedFields = Object.keys(include)
+    const includedTables = includedFields.map((field: string): Rel => {
+      // Fetch the table that is included
+      const relatedTableName = this._dbDescription.getRelatedTable(
+        this.tableName,
+        field
+      )
+      const fkk = this._dbDescription.getForeignKey(this.tableName, field)
+      const relatedTable = this._tables.get(relatedTableName)!
+
+      // And follow nested includes
+      const includedObj = (include as any)[field]
+      if (
+        typeof includedObj === 'object' &&
+        !Array.isArray(includedObj) &&
+        includedObj !== null
+      ) {
+        // There is a nested include, follow it
+        return {
+          foreignKey: [fkk],
+          select: relatedTable.computeShape(includedObj),
+        }
+      } else if (typeof includedObj === 'boolean' && includedObj) {
+        return {
+          foreignKey: [fkk],
+          select: {
+            tablename: relatedTableName,
+          },
+        }
+      } else {
+        throw new Error(
+          `Unexpected value in include tree for sync: ${JSON.stringify(
+            includedObj
+          )}`
+        )
+      }
+    })
+
+    const whereClause = makeSqlWhereClause(where)
+    return {
+      tablename: this.tableName,
+      include: includedTables,
+      ...(whereClause === '' ? {} : { where: whereClause }),
+    }
+  }
+
+  protected getIncludedTables<T extends SyncInput<Include, unknown>>(
     i: T
   ): Set<AnyTable> {
     // Recursively go over the included fields
@@ -153,11 +231,7 @@ export class Table<
       const extendedTable = includedTables.add(relatedTable)
       // And follow nested includes
       const includedObj = (include as any)[field]
-      if (
-        typeof includedObj === 'object' &&
-        !Array.isArray(includedObj) &&
-        includedObj !== null
-      ) {
+      if (isObject(includedObj)) {
         // There is a nested include, follow it
         const nestedTables = relatedTable.getIncludedTables(includedObj)
         nestedTables.forEach((tbl) => extendedTable.add(tbl))
@@ -176,15 +250,9 @@ export class Table<
     return includedTables
   }
 
-  sync<T extends SyncInput<Include>>(i?: T): Promise<ShapeSubscription> {
+  sync<T extends SyncInput<Include, Where>>(i?: T): Promise<ShapeSubscription> {
     const validatedInput = this.syncSchema.parse(i ?? {})
-    // Recursively go over the included fields
-    // and for each field store its table
-    const tables = Array.from(this.getIncludedTables(validatedInput)) // the tables the user wants to subscribe to
-    const tableNames = tables.map((tbl) => tbl.tableName)
-    const shape = {
-      tables: tableNames,
-    }
+    const shape = this.computeShape(validatedInput)
     return this._shapeManager.sync(shape)
   }
 
@@ -391,7 +459,7 @@ export class Table<
         const relatedTbl = this._tables.get(relatedTable)!
         relatedTbl._create(
           { data: relatedObject },
-          db,
+          db.withTableSchema(relatedTbl._fields),
           (createdRelatedObject) => {
             delete data[relationField] // remove the relation field
             data[fromField] = createdRelatedObject[toField] // fill in the FK
@@ -443,7 +511,7 @@ export class Table<
             relatedObject[fromField] = obj[toField] // fill in FK
             relatedTbl._create(
               { data: relatedObject },
-              db,
+              db.withTableSchema(relatedTbl._fields),
               () => {
                 oldMakeRelatedObjects(obj, cont)
               },
@@ -655,13 +723,15 @@ export class Table<
     relationType: Arity,
     includeArg: true | FindInput<any, any, any, any, any>,
     db: DB,
-    onResult: (joinedRows: Kind<GetPayload, T>[]) => void,
+    onResult: () => void,
     onError: (err: any) => void
   ) {
     const otherTable = this._tables.get(relatedTable)!
     const args = includeArg === true ? {} : includeArg
     const where = typeof args.where === 'undefined' ? {} : args.where
-    const foreignKeys = rows.map((row) => row[fromField as keyof typeof row])
+    const foreignKeys = rows
+      .map((row) => row[fromField as keyof typeof row])
+      .filter((fk) => fk !== null && fk !== undefined)
     otherTable._findMany(
       {
         ...args,
@@ -672,11 +742,12 @@ export class Table<
           },
         },
       },
-      db,
+      db.withTableSchema(otherTable._fields),
       (relatedRows: object[]) => {
         // Now, join the original `rows` with the `relatedRows`
         // where `row.fromField == relatedRow.toField`
-        const join = this.joinObjects(
+        // (this mutates the original rows)
+        this.joinObjects(
           rows,
           relatedRows,
           fromField,
@@ -684,7 +755,7 @@ export class Table<
           relationField,
           relationType
         ) as Kind<GetPayload, T>[]
-        onResult(join)
+        onResult()
       },
       onError
     )
@@ -695,11 +766,11 @@ export class Table<
     relation: Relation,
     includeArg: boolean | FindInput<any, any, any, any, any>,
     db: DB,
-    onResult: (rows: Kind<GetPayload, T>[]) => void,
+    onResult: () => void,
     onError: (err: any) => void
   ) {
     if (includeArg === false) {
-      return onResult([])
+      return onResult()
     } else if (relation.isIncomingRelation()) {
       // incoming relation from the `fromField` in the other table
       // to the `toField` in this table
@@ -760,9 +831,6 @@ export class Table<
       return onResult(rows)
     else {
       const relationFields = Object.keys(include)
-      let includedRows: Kind<GetPayload, T>[] = []
-      // TODO: everywhere we use forEachCont we probably don't need continuation passing style!
-      //       so try to remove it there and then rename this one to `forEachCont`
       forEach(
         (relationField: string, cont: () => void) => {
           if (
@@ -785,22 +853,20 @@ export class Table<
             relationName
           )
 
+          // `fetchInclude` mutates the `rows` to include the related objects
           this.fetchInclude(
             rows,
             relation,
             include[relationField],
             db,
-            (fetchedRows) => {
-              includedRows = includedRows.concat(fetchedRows)
-              cont()
-            },
+            cont,
             onError
           )
         },
         relationFields,
         () => {
           // once the loop finished, call `onResult`
-          onResult(includedRows)
+          onResult(rows)
         }
       )
     }
@@ -911,7 +977,7 @@ export class Table<
             data: obj.data,
             where: whereArg,
           },
-          db,
+          db.withTableSchema(relatedTbl._fields),
           cont,
           onError
         )
@@ -926,7 +992,7 @@ export class Table<
               [toField]: fromFieldValue,
             },
           },
-          db,
+          db.withTableSchema(relatedTbl._fields),
           cont,
           onError
         )
@@ -994,7 +1060,7 @@ export class Table<
                   [fromField]: originalObject[toField],
                 },
               },
-              db,
+              db.withTableSchema(relatedTable._fields),
               cont,
               onError
             )
@@ -1432,7 +1498,10 @@ export class Table<
     continuation: (res: Kind<GetPayload, T>) => void,
     onError: (err: any) => void
   ) {
-    const data = transformUpsert(validate(i, this.upsertSchema), this._fields)
+    // validate but do not transform - upsert will call either
+    // create or update that will perform the appropriate transforms
+    validate(i, this.upsertSchema)
+
     // Check if the record exists
     this._findUnique(
       { where: i.where } as any,
@@ -1442,10 +1511,10 @@ export class Table<
           // Create the record
           return this._create(
             {
-              data: data.create,
-              select: data.select,
-              ...(notNullNotUndefined(data.include) && {
-                include: data.include,
+              data: i.create,
+              select: i.select,
+              ...(notNullNotUndefined(i.include) && {
+                include: i.include,
               }), // only add `include` property if it is defined
             } as any,
             db,
@@ -1456,11 +1525,11 @@ export class Table<
           // Update the record
           return this._update(
             {
-              data: data.update,
-              where: data.where,
-              select: data.select,
-              ...(notNullNotUndefined(data.include) && {
-                include: data.include,
+              data: i.update,
+              where: i.where,
+              select: i.select,
+              ...(notNullNotUndefined(i.include) && {
+                include: i.include,
               }), // only add `include` property if it is defined
             } as any,
             db,
@@ -1520,7 +1589,7 @@ export class Table<
 
   private makeLiveResult<T>(
     runner: () => Promise<T>,
-    i: SyncInput<Include>
+    i: SyncInput<Include, unknown>
   ): LiveResultContext<T> {
     const tables = [...this.getIncludedTables(i)].map(
       (x) => x._qualifiedTableName
@@ -1531,17 +1600,77 @@ export class Table<
         return new LiveResult(res, tables)
       })
     })
+
+    result.subscribe = createQueryResultSubscribeFunction(
+      this._notifier,
+      result,
+      tables
+    )
     result.sourceQuery = i
     return result
   }
+
+  setReplicationTransform(i: ReplicatedRowTransformer<T>): void {
+    // forbid transforming relation keys to avoid breaking
+    // referential integrity
+    const relations = this._dbDescription.getRelations(this.tableName)
+    const immutableFields = relations.map((r) => r.relationField)
+    this._replicationTransformManager.setTableTransform(
+      this._qualifiedTableName,
+      {
+        transformInbound: (record) =>
+          transformTableRecord(
+            record,
+            i.transformInbound,
+            this._fields,
+            this._schema,
+            immutableFields
+          ),
+
+        transformOutbound: (record) =>
+          transformTableRecord(
+            record,
+            i.transformOutbound,
+            this._fields,
+            this._schema,
+            immutableFields
+          ),
+      }
+    )
+  }
+
+  clearReplicationTransform(): void {
+    this._replicationTransformManager.clearTableTransform(
+      this._qualifiedTableName
+    )
+  }
 }
 
-export function raw(adapter: DatabaseAdapter, sql: Statement): Promise<Row[]> {
+export function unsafeExec(
+  adapter: DatabaseAdapter,
+  sql: Statement
+): Promise<Row[]> {
   return adapter.query(sql)
 }
 
-export function liveRaw(
+export function rawQuery(
   adapter: DatabaseAdapter,
+  sql: Statement
+): Promise<Row[]> {
+  // only allow safe queries from the client
+  if (isPotentiallyDangerous(sql.sql)) {
+    throw new InvalidArgumentError(
+      'Cannot use queries that might alter the store - ' +
+        'please use read-only queries'
+    )
+  }
+
+  return unsafeExec(adapter, sql)
+}
+
+export function liveRawQuery(
+  adapter: DatabaseAdapter,
+  notifier: Notifier,
   sql: Statement
 ): LiveResultContext<Row[]> {
   const result = <LiveResultContext<Row[]>>(async () => {
@@ -1549,9 +1678,62 @@ export function liveRaw(
     // because this is a raw query so
     // we cannot trust that it queries this table
     const tablenames = parseTableNames(sql.sql)
-    const res = await raw(adapter, sql)
+    const res = await rawQuery(adapter, sql)
     return new LiveResult(res, tablenames)
   })
+
+  result.subscribe = createQueryResultSubscribeFunction(
+    notifier,
+    result,
+    parseTableNames(sql.sql)
+  )
   result.sourceQuery = sql
   return result
+}
+
+/** Compile Prisma-like where-clause object into a SQL where clause that the server can understand. */
+function makeSqlWhereClause(where: string | Record<string, any>): string {
+  if (typeof where === 'string') return where
+
+  const statements = Object.entries(where)
+    .flatMap(([key, value]) => makeFilter(value, key, 'this.'))
+    .map(interpolateArgs)
+
+  if (statements.length < 2) return statements[0] ?? ''
+  else return statements.map((x) => '(' + x + ')').join(' AND ')
+}
+
+/** Replace all `?` parameter placeholders in SQL with provided args. */
+function interpolateArgs({
+  sql,
+  args,
+}: {
+  sql: string
+  args?: unknown[]
+}): string {
+  if (args === undefined) return sql
+
+  let matchPos = 0
+  const argsLength = args.length
+  /* We're looking for any `?` in the provided sql statement that aren't preceded by a word character
+     This is how `builder.ts#makeFilter` builds SQL statements, but we need to interpolate them before
+     sending to the server. SQL here shouldn't contain any user strings, only placeholders, so it's safe.
+  */
+  return sql.replaceAll(/(?<!\w)\?/g, (match) =>
+    matchPos < argsLength ? quoteValue(args[matchPos++]) : match
+  )
+}
+
+/** Quote a JS value to be inserted in a PostgreSQL where query for the server. */
+function quoteValue(value: unknown): string {
+  if (typeof value === 'string') return `'${value.replaceAll("'", "''")}'`
+  if (typeof value === 'number') return value.toString()
+  if (value instanceof Date && !isNaN(value.valueOf()))
+    return `'${value.toISOString()}'`
+  if (typeof value === 'boolean') return value.toString()
+  if (Array.isArray(value)) return `(${value.map(quoteValue).join(', ')})`
+
+  throw new Error(
+    `Sorry! We currently cannot handle where clauses using value ${value}. You can try serializing it to a string yourself. \nPlease leave a feature request at https://github.com/electric-sql/electric/issues.`
+  )
 }

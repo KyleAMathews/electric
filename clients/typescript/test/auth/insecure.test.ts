@@ -1,18 +1,18 @@
 import test from 'ava'
-import { decodeJwt } from 'jose'
+import { jwtDecode } from '../../src/auth/decode'
 
 import { insecureAuthToken } from '../../src/auth'
 
 test('insecureAuthToken generates expected token', async (t) => {
-  const token = insecureAuthToken({ user_id: 'dummy-user' })
+  const token = insecureAuthToken({ sub: 'dummy-user' })
 
-  const claims = decodeJwt(token)
-  t.deepEqual(claims, { user_id: 'dummy-user' })
+  const claims = jwtDecode(token)
+  t.deepEqual(claims, { sub: 'dummy-user' })
 })
 
 test('insecureAuthToken supports non-latin characters', async (t) => {
-  const token = insecureAuthToken({ user_id: '⚡' })
+  const token = insecureAuthToken({ sub: '⚡' })
 
-  const claims = decodeJwt(token)
-  t.deepEqual(claims, { user_id: '⚡' })
+  const claims = jwtDecode(token)
+  t.deepEqual(claims, { sub: '⚡' })
 })

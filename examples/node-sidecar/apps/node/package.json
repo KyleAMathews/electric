@@ -1,0 +1,34 @@
+{
+  "name": "electric-sql-wa-sqlite-example",
+  "version": "0.7.0",
+  "author": "ElectricSQL",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "backend:start": "npx electric-sql start --with-postgres",
+    "backend:stop": "npx electric-sql stop",
+    "backend:up": "npx electric-sql start --with-postgres --detach",
+    "backend:down": "npx electric-sql stop --remove",
+    "client:generate": "npx electric-sql generate",
+    "client:watch": "npx electric-sql generate --watch",
+    "db:migrate": "npx electric-sql with-config \"npx pg-migrations apply --database {{ELECTRIC_PROXY}} --directory ./db/migrations\"",
+    "db:psql": "npx electric-sql psql",
+    "electric:start": "npx electric-sql start",
+    "build": "npx tsc",
+    "start": "npm run build && node dist/index.js"
+  },
+  "engines": {
+    "node": ">=16.11.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.2.2",
+    "electric-sql": "^0.9.4"
+  },
+  "devDependencies": {
+    "@databases/pg-migrations": "^5.0.2",
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": ">=16.11.0",
+    "fs-extra": "^10.0.0",
+    "typescript": "^4.4.3"
+  }
+}

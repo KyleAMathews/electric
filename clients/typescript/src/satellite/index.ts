@@ -1,3 +1,4 @@
+import Long from 'long'
 import { AuthConfig, AuthState } from '../auth/index'
 import { InternalElectricConfig } from '../config/index'
 import { DatabaseAdapter } from '../electric/adapter'
@@ -16,9 +17,14 @@ import {
   TransactionCallback,
   RelationCallback,
   OutboundStartedCallback,
+  SatelliteError,
+  ReplicationStatus,
+  AdditionalDataCallback,
+  Record,
+  ReplicatedRowTransformer,
 } from '../util/types'
 import {
-  ClientShapeDefinition,
+  Shape,
   ShapeRequest,
   SubscribeResponse,
   SubscriptionDeliveredCallback,
@@ -27,13 +33,19 @@ import {
 } from './shapes/types'
 import { ShapeSubscription } from './process'
 import { DbSchema } from '../client/model/schema'
+import { QualifiedTablename } from '../util'
 
 export { SatelliteProcess } from './process'
 export { GlobalRegistry, globalRegistry } from './registry'
 export type { ShapeSubscription } from './process'
+export type { Shape, Rel } from './shapes/types'
 
 // `Registry` that starts one Satellite process per database.
 export interface Registry {
+  satellites: {
+    [key: DbName]: Satellite
+  }
+
   ensureStarted(
     dbName: DbName,
     dbDescription: DbSchema<any>,
@@ -48,10 +60,6 @@ export interface Registry {
   stopAll(): Promise<void>
 }
 
-export type ConnectionWrapper = {
-  connectionPromise: Promise<void | Error>
-}
-
 // `Satellite` is the main process handling ElectricSQL replication,
 // processing the opslog and notifying when there are data changes.
 export interface Satellite {
@@ -63,12 +71,22 @@ export interface Satellite {
 
   connectivityState?: ConnectivityState
 
-  start(authConfig: AuthConfig): Promise<ConnectionWrapper>
+  start(authConfig: AuthConfig): Promise<void>
   stop(shutdown?: boolean): Promise<void>
-  subscribe(
-    shapeDefinitions: ClientShapeDefinition[]
-  ): Promise<ShapeSubscription>
+  setToken(token?: string): void
+  hasToken(): boolean
+  connectWithBackoff(): Promise<void>
+  disconnect(error?: SatelliteError): void
+  clientDisconnect(): void
+  authenticate(token: string): Promise<void>
+  subscribe(shapeDefinitions: Shape[]): Promise<ShapeSubscription>
   unsubscribe(shapeUuid: string): Promise<void>
+
+  setReplicationTransform(
+    tableName: QualifiedTablename,
+    transform: ReplicatedRowTransformer<Record>
+  ): void
+  clearReplicationTransform(tableName: QualifiedTablename): void
 }
 
 export interface Client {
@@ -77,16 +95,20 @@ export interface Client {
   shutdown(): void
   authenticate(authState: AuthState): Promise<AuthResponse>
   isConnected(): boolean
+  getOutboundReplicationStatus(): ReplicationStatus
   startReplication(
     lsn?: LSN,
     schemaVersion?: string,
-    subscriptionIds?: string[]
+    subscriptionIds?: string[],
+    observedTransactionData?: Long[]
   ): Promise<StartReplicationResponse>
   stopReplication(): Promise<StopReplicationResponse>
   subscribeToRelations(callback: RelationCallback): void
   unsubscribeToRelations(callback: RelationCallback): void
   subscribeToTransactions(callback: TransactionCallback): void
   unsubscribeToTransactions(callback: TransactionCallback): void
+  subscribeToAdditionalData(callback: AdditionalDataCallback): void
+  unsubscribeToAdditionalData(callback: AdditionalDataCallback): void
   enqueueTransaction(transaction: DataTransaction): void
   getLastSentLsn(): LSN
   subscribeToOutboundStarted(callback: OutboundStartedCallback): void
@@ -105,4 +127,10 @@ export interface Client {
     successCallback: SubscriptionDeliveredCallback,
     errorCallback: SubscriptionErrorCallback
   ): void
+
+  setReplicationTransform(
+    tableName: QualifiedTablename,
+    transformer: ReplicatedRowTransformer<Record>
+  ): void
+  clearReplicationTransform(tableName: QualifiedTablename): void
 }

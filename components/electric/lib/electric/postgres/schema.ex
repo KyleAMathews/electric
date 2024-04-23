@@ -1,15 +1,16 @@
 defmodule Electric.Postgres.Schema do
-  defstruct tables: [], indexes: [], triggers: [], views: []
+  import Electric.Postgres.Extension, only: [is_extension_relation: 1]
+  import Electric.Postgres.Schema.Proto, only: [is_unique_constraint: 1]
 
-  alias Electric.Postgres.Schema.Proto
+  alias Electric.Postgres.Extension
   alias Electric.Postgres.Replication
+  alias Electric.Postgres.Schema.Proto
   alias PgQuery, as: Pg
 
   require Logger
 
-  import Electric.Postgres.Schema.Proto, only: [is_unique_constraint: 1]
-
-  @search_paths [nil, "public"]
+  @public_schema "public"
+  @search_paths [nil, @public_schema]
 
   @type t() :: %Proto.Schema{}
 
@@ -31,17 +32,10 @@ defmodule Electric.Postgres.Schema do
     end)
   end
 
-  def name(%{name: name}) when is_binary(name) do
-    name(name)
-  end
-
-  # don't double quote things
-  def name("\"" <> _rest = name) when is_binary(name) do
-    name
-  end
-
-  def name(name) when is_binary(name) do
-    "\"" <> name <> "\""
+  def num_electrified_tables(schema) do
+    Enum.count(schema.tables, fn %{name: name} ->
+      not is_extension_relation({name.schema, name.name})
+    end)
   end
 
   def indexes(schema, opts \\ []) do
@@ -138,18 +132,44 @@ defmodule Electric.Postgres.Schema do
   def public_fk_graph(%Proto.Schema{tables: tables}) do
     graph =
       tables
-      |> Enum.filter(&(&1.name.schema == "public"))
-      |> Enum.map(& &1.name.name)
+      |> Enum.filter(&(&1.name.schema == @public_schema))
+      |> Enum.map(&{@public_schema, &1.name.name})
       |> then(&Graph.add_vertices(Graph.new(), &1))
 
     Enum.reduce(tables, graph, fn %Proto.Table{constraints: constraints, name: name}, graph ->
       constraints
       |> Enum.filter(&match?(%{constraint: {:foreign, _}}, &1))
       |> Enum.map(fn %{constraint: {:foreign, fk}} ->
-        {name.name, fk.pk_table.name, label: fk.fk_cols}
+        {{@public_schema, name.name}, {@public_schema, fk.pk_table.name}, label: fk.fk_cols}
       end)
       |> then(&Graph.add_edges(graph, &1))
     end)
+  end
+
+  @spec lookup_enum_values([%Proto.Enum{}], String.t()) :: [String.t()] | nil
+  def lookup_enum_values(enums, typename) do
+    Enum.find(enums, fn %{name: name} ->
+      qualified_name = name.schema <> "." <> name.name
+
+      typename == qualified_name or
+        (name.schema == @public_schema and typename == name.name)
+    end)
+    |> case do
+      nil -> nil
+      enum -> enum.values
+    end
+  end
+
+  @spec table_info!(t(), {name(), name()} | integer()) :: Replication.Table.t()
+  def table_info!(schema, oid_or_tuple) do
+    {:ok, table_info} = table_info(schema, oid_or_tuple)
+    table_info
+  end
+
+  @spec table_info!(t(), name(), name()) :: Replication.Table.t()
+  def table_info!(schema, pg_schema, table_name) do
+    {:ok, table_info} = table_info(schema, pg_schema, table_name)
+    table_info
   end
 
   @doc """
@@ -164,14 +184,14 @@ defmodule Electric.Postgres.Schema do
   @spec table_info(t(), integer()) :: {:ok, Replication.Table.t()} | {:error, term()}
   def table_info(schema, oid) when is_integer(oid) do
     with {:ok, table} <- lookup_oid(schema, oid) do
-      {:ok, table_info(table)}
+      {:ok, single_table_info(table, schema)}
     end
   end
 
   @spec table_info(t(), name(), name()) :: {:ok, Replication.Table.t()} | {:error, term()}
   def table_info(schema, sname, tname) when is_binary(sname) and is_binary(tname) do
     with {:ok, table} <- fetch_table(schema, {sname, tname}) do
-      {:ok, table_info(table)}
+      {:ok, single_table_info(table, schema)}
     end
   end
 
@@ -180,18 +200,18 @@ defmodule Electric.Postgres.Schema do
   """
   @spec table_info(t()) :: [Replication.Table.t()]
   def table_info(%Proto.Schema{} = schema) do
-    for table <- schema.tables, do: table_info(table)
+    for table <- schema.tables, do: single_table_info(table, schema)
   end
 
-  @spec table_info(%Proto.Table{}) :: Replication.Table.t()
-  def table_info(%Proto.Table{} = table) do
+  @spec single_table_info(%Proto.Table{}, t) :: Replication.Table.t()
+  def single_table_info(%Proto.Table{} = table, schema) do
     {:ok, pks} = primary_keys(table)
 
     columns =
       for col <- table.columns do
         %Replication.Column{
           name: col.name,
-          type: col_type(col.type),
+          type: col_type(col.type, schema.enums),
           nullable?: col_nullable?(col),
           type_modifier: List.first(col.type.size, -1),
           # since we're using replication identity "full" all columns
@@ -212,28 +232,25 @@ defmodule Electric.Postgres.Schema do
     table_info
   end
 
-  defp col_type(%{name: name, array: [_ | _]}), do: {:array, col_type(name)}
-  defp col_type(%{name: name}), do: col_type(name)
+  defp col_type(%{name: name, array: [_ | _]}, enums), do: {:array, col_type(name, enums)}
+  defp col_type(%{name: name}, enums), do: col_type(name, enums)
 
-  defp col_type("serial2"), do: :int2
-  defp col_type(t) when t in ["serial", "serial4"], do: :int4
-  defp col_type("serial8"), do: :int8
-  defp col_type(t) when is_binary(t), do: String.to_atom(t)
+  defp col_type("serial2", _enums), do: :int2
+  defp col_type(t, _enums) when t in ["serial", "serial4"], do: :int4
+  defp col_type("serial8", _enums), do: :int8
+
+  defp col_type(t, enums) do
+    if lookup_enum_values(enums, t) do
+      t
+    else
+      String.to_atom(t)
+    end
+  end
 
   defp col_nullable?(col) do
     col.constraints
     |> Enum.find(&match?(%Proto.Constraint{constraint: {:not_null, _}}, &1))
     |> is_nil()
-  end
-
-  def relation(schema, sname, tname) do
-    with {:ok, table} <- fetch_table(schema, {sname, tname}) do
-      table_info(table)
-    end
-  end
-
-  def relation(schema, {sname, tname}) do
-    relation(schema, sname, tname)
   end
 
   # want table constraint order to be constistent so that we can verify the in-memory schema with
@@ -480,7 +497,7 @@ defmodule Electric.Postgres.Schema do
         &Map.update!(&1, :name, fn n -> String.slice("__reordered_#{n}", 0..63) end)
       )
 
-    {schema, table_name} = shadow_table_name(main.name.schema, main.name.name)
+    {schema, table_name} = Extension.shadow_of({main.name.schema, main.name.name})
 
     {:ok, oid} = oid_loader.(:table, @schema, table_name)
 
@@ -494,21 +511,5 @@ defmodule Electric.Postgres.Schema do
       constraints: Enum.filter(main.constraints, &match?(%{constraint: {:primary, _}}, &1)),
       indexes: []
     }
-  end
-
-  @doc """
-  Returns the schema and name of the shadow table for the given table.
-  """
-  @spec shadow_table_name(name(), name()) :: namespaced_name()
-  def shadow_table_name(schema, table) do
-    {@schema, "shadow__#{schema}__#{table}"}
-  end
-
-  @doc """
-  Returns the schema and name of the tombstone table for the given table.
-  """
-  @spec tombstone_table_name(name(), name()) :: namespaced_name()
-  def tombstone_table_name(schema, table) do
-    {@schema, "tombstone__#{schema}__#{table}"}
   end
 end

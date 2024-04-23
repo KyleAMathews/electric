@@ -6,7 +6,7 @@ description: >-
 
 There are many alternative systems for developing local-first applications. We list a selection of them below.
 
-You can also find out more about local-first software development and discover other projects from a range of communities, including [localfirstweb.dev](https://localfirstweb.dev) and [crdt.tech](https://crdt.tech).
+You can also find out more about local-first software development and discover other projects from a range of communities, including [lofi.software](https://lofi.software), [localfirst.fm](https://www.localfirst.fm), [Local-first Conf](https://www.localfirstconf.com) and [crdt.tech](https://crdt.tech).
 
 :::note
 If you'd like to add your project to the list, please feel free to [make a pull request](https://github.com/electric-sql/electric/pulls).
@@ -33,8 +33,10 @@ Some of the projects that are either closer to ElectricSQL or generally better k
 Other local-first projects:
 
 - [Ampli-sync](https://ampliapps.com/sqlite-sync)
+- [CASE](https://case.app).
 - [Concordant](https://concordant.io)
 - [CRStore](https://github.com/Azarattum/CRStore)
+- [DefraDB](https://source.network/defra-db)
 - [DXOS](https://dxos.org)
 - [EweserDB](https://github.com/eweser/eweser-db)
 - [Fireproof](https://fireproof.storage)
@@ -95,6 +97,7 @@ Other local-first projects:
 - [Declarative Dataflow](https://github.com/comnik/declarative-dataflow)
 - [Electric Clojure](https://github.com/hyperfiddle/electric)
 - [SOLID](https://solidproject.org)
+- [Source](https://source.network)
 
 ## Other areas
 

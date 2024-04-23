@@ -11,7 +11,8 @@ defmodule Electric.Satellite.Protobuf do
     SatShapeDataBegin,
     SatShapeDataEnd,
     SatRpcRequest,
-    SatRpcResponse
+    SatRpcResponse,
+    SatOpLogAck
   }
 
   require Logger
@@ -30,7 +31,8 @@ defmodule Electric.Satellite.Protobuf do
     SatShapeDataBegin => 17,
     SatShapeDataEnd => 18,
     SatRpcRequest => 21,
-    SatRpcResponse => 22
+    SatRpcResponse => 22,
+    SatOpLogAck => 23
   }
 
   if Enum.any?(Map.values(@mapping), &(&1 in @reserved)) do
@@ -107,6 +109,7 @@ defmodule Electric.Satellite.Protobuf do
         SatOpInsert,
         SatOpUpdate,
         SatOpMigrate,
+        SatOpCompensation,
         SatTransOp,
         SatRelation,
         SatRelationColumn,
@@ -120,18 +123,12 @@ defmodule Electric.Satellite.Protobuf do
         SatShapeReq,
         SatShapeDef,
         SatUnsubsReq,
-        SatUnsubsResp
+        SatUnsubsResp,
+        SatOpAdditionalBegin,
+        SatOpAdditionalCommit,
+        SatOpLogAck
       }
     end
-  end
-
-  defmodule Version do
-    defstruct major: nil, minor: nil
-
-    @type t() :: %__MODULE__{
-            major: integer,
-            minor: integer
-          }
   end
 
   @spec decode(byte(), binary()) :: {:ok, sq_pb_msg()} | {:error, any()}

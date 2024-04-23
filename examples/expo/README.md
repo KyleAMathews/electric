@@ -22,17 +22,10 @@ See the [Expo installation docs here](https://docs.expo.dev/get-started/installa
 
 ## Install
 
-Clone the [electric-sql/electric](https://github.com/electric-sql/electric) mono-repo and change directory into this example folder:
-
-```sh
-git clone https://github.com/electric-sql/electric
-cd electric/examples/expo
-```
-
 Install the dependencies:
 
 ```sh
-yarn
+npm install
 ```
 
 ## Setup
@@ -40,35 +33,41 @@ yarn
 Start Postgres and Electric using Docker (see [running the examples](https://electric-sql.com/docs/examples/notes/running) for more options):
 
 ```shell
-yarn backend:up
-# Or `yarn backend:start` to foreground
+npm run backend:up
+# Or `npm run backend:start` to foreground
 ```
 
 Note that, if useful, you can connect to Postgres using:
 
 ```shell
-yarn db:psql
+npm run db:psql
 ```
 
 Setup your [database schema](https://electric-sql.com/docs/usage/data-modelling):
 
 ```shell
-yarn db:migrate
+npm run db:migrate
 ```
 
 Generate your [type-safe client](https://electric-sql.com/docs/usage/data-access/client):
 
 ```shell
-yarn client:generate
-# or `yarn client:watch`` to re-generate whenever the DB schema changes
+npm run client:generate
+# or `npm run client:watch`` to re-generate whenever the DB schema changes
 ```
 
 ## Run
 
-Run in the iOS simulator:
+Run on the iOS simulator:
 
 ```shell
-yarn start:ios
+npm run start:ios
+```
+
+Run on the Android emulator:
+
+```shell
+npm run start:android
 ```
 
 ## More information

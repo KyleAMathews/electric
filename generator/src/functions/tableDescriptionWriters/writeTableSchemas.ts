@@ -44,7 +44,15 @@ export function writeTableSchemas(
           .writeLine(
             `readonly _A?: boolean | null | undefined | Prisma.${modelName}Args`
           )
-          .writeLine(`readonly type: Prisma.${modelName}GetPayload<this['_A']>`)
+
+          // NOTE: This is a hack to get around a limitation in the TypeScript >=5.4 compiler
+          // that enforces stricter conditional type constraints, see:
+          // https://devblogs.microsoft.com/typescript/announcing-typescript-5-4/#notable-behavioral-changes
+          // The issue is resolved with Prisma >=4.16.0, we can remove once we update
+          // .writeLine(`readonly type: Prisma.${modelName}GetPayload<this['_A']>`)
+          .writeLine(
+            `readonly type: Omit<Prisma.${modelName}GetPayload<this['_A']>, "Please either choose \`select\` or \`include\`">`
+          )
       })
       .blankLine()
   })
@@ -79,6 +87,10 @@ export function writeTableSchemas(
   writer
     .writeLine('export const schema = new DbSchema(tableSchemas, migrations)')
     .writeLine('export type Electric = ElectricClient<typeof schema>')
+    .conditionalWriteLine(
+      dmmf.schema.hasJsonTypes,
+      'export const JsonNull = { __is_electric_json_null__: true }'
+    )
 }
 
 export function writeFieldsMap(
@@ -102,16 +114,17 @@ export function writeFieldsMap(
 function pgType(field: ExtendedDMMFField, modelName: string): string {
   const prismaType = field.type
   const attributes = field.attributes
+  const getTypeAttribute = () =>
+    attributes.find((a) => a.type.startsWith('@db'))
   switch (prismaType) {
-    // BigInt, Boolean, Bytes, DateTime, Decimal, Float, Int, JSON, String
     case 'String':
-      return stringToPg(attributes)
+      return stringToPg(getTypeAttribute())
     case 'Int':
-      return intToPg(attributes)
+      return intToPg(getTypeAttribute())
     case 'Boolean':
       return 'BOOL'
     case 'DateTime':
-      return dateTimeToPg(attributes, field.name, modelName)
+      return dateTimeToPg(getTypeAttribute(), field.name, modelName)
     case 'BigInt':
       return 'INT8'
     case 'Bytes':
@@ -119,20 +132,39 @@ function pgType(field: ExtendedDMMFField, modelName: string): string {
     case 'Decimal':
       return 'DECIMAL'
     case 'Float':
-      return 'FLOAT8'
-    case 'JSON':
-      return 'JSON'
+      return floatToPg(getTypeAttribute())
+    case 'Json':
+      return jsonToPg(attributes)
     default:
+      if (field.kind === 'enum') return 'TEXT' // treat enums as TEXT such that the ts-client correctly serializes/deserialises them as text
       return 'UNRECOGNIZED PRISMA TYPE'
   }
 }
 
+function floatToPg(pgTypeAttribute: Attribute | undefined): string {
+  if (!pgTypeAttribute || pgTypeAttribute.type === '@db.DoublePrecision') {
+    // If Prisma did not add a type attribute then the PG type was FLOAT8
+    return 'FLOAT8'
+  } else {
+    return 'FLOAT4'
+  }
+}
+
+function jsonToPg(attributes: Array<Attribute>) {
+  const pgTypeAttribute = attributes.find((a) => a.type.startsWith('@db'))
+  if (pgTypeAttribute && pgTypeAttribute.type === '@db.Json') {
+    return 'JSON'
+  } else {
+    // default mapping for Prisma's `Json` type is PG's JSONB
+    return 'JSONB'
+  }
+}
+
 function dateTimeToPg(
-  attributes: Array<Attribute>,
+  a: Attribute | undefined,
   field: string,
   model: string
 ): string {
-  const a = attributes.find((a) => a.type.startsWith('@db'))
   const type = a?.type
   const mapping = new Map([
     ['@db.Timestamptz', 'TIMESTAMPTZ'],
@@ -159,8 +191,7 @@ function dateTimeToPg(
   }
 }
 
-function stringToPg(attributes: Array<Attribute>) {
-  const pgTypeAttribute = attributes.find((a) => a.type.startsWith('@db'))
+function stringToPg(pgTypeAttribute: Attribute | undefined) {
   if (!pgTypeAttribute || pgTypeAttribute.type === '@db.Text') {
     // If Prisma does not add a type attribute then the PG type was TEXT
     return 'TEXT'
@@ -171,8 +202,7 @@ function stringToPg(attributes: Array<Attribute>) {
   }
 }
 
-function intToPg(attributes: Array<Attribute>) {
-  const pgTypeAttribute = attributes.find((a) => a.type.startsWith('@db'))
+function intToPg(pgTypeAttribute: Attribute | undefined) {
   if (pgTypeAttribute?.type === '@db.SmallInt') {
     return 'INT2'
   } else {
@@ -262,7 +292,7 @@ export function writeTableDescriptionType(
   fileWriter.writer
     .write('TableSchema<')
     .newLine()
-    .writeLine(`  z.infer<typeof ${modelName}CreateInputSchema>,`)
+    .writeLine(`  z.infer<typeof ${modelName}UncheckedCreateInputSchema>,`)
     .writeLine(`  Prisma.${modelName}CreateArgs['data'],`)
     .writeLine(`  Prisma.${modelName}UpdateArgs['data'],`)
     .writeLine(`  Prisma.${modelName}FindFirstArgs['select'],`)

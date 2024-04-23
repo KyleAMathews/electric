@@ -1,6 +1,6 @@
 [global node=>]
 
-[macro connect_to_electric host port migrations]
+[macro connect_to_electric host port migrations connectToElectric]
     !client = await import('./dist/client.js')
     ??$node
     # !migrations = await client.read_migrations(process.env.MIGRATION_DIRS + "/index.js")
@@ -9,26 +9,42 @@
     ??$node
     !originalDb = client.make_db(process.env.SATELLITE_DB_PATH + "/$LUX_SHELLNAME")
     ??$node
-    [invoke electrify_db "originalDb" $host $port $migrations]
+    [invoke electrify_db "originalDb" $host $port $migrations $connectToElectric]
     ??(in electrify_db) config:
 [endmacro]
 
-[macro electrify_db db host port migrations]
+[macro electrify_db db host port migrations connectToElectric]
+     # define `exp` to avoid `ReferenceError: exp is not defined`
+     # when trying to read `exp` when calling `electrify_db`
+     !if (typeof exp === 'undefined') { var exp = undefined }
+     ??$node
+
      !db = await client.electrify_db(originalDb, \
                                      "$host", \
                                      $port, \
-                                     $migrations)
+                                     $migrations, \
+                                     $connectToElectric, \
+                                     exp)
 [endmacro]
 
-[macro setup_client_with_migrations satellite_number electric port migrations]
+[macro setup_client_with_migrations satellite_number electric port migrations connectToElectric]
     [invoke start_satellite $satellite_number]
     -$fail_pattern
     ??$node
-    [invoke connect_to_electric $electric $port $migrations]
+    [invoke connect_to_electric $electric $port $migrations $connectToElectric]
+[endmacro]
+
+[macro client_disconnect]
+    !await client.disconnect(db)
+    ??$node
+[endmacro]
+
+[macro client_reconnect]
+    !await client.reconnect(db)
 [endmacro]
 
 [macro setup_client satellite_number electric port]
-    [invoke setup_client_with_migrations $satellite_number $electric $port "[]"]
+    [invoke setup_client_with_migrations $satellite_number $electric $port "[]" "true"]
 [endmacro]
 
 [macro node_await_get match]
@@ -55,11 +71,16 @@
     [invoke wait-for "await client.get_float(db, '${id}')" "${id}" 10 $node]
 [endmacro]
 
-[macro node_write_float id value]
-    # Can write valid floats to the DB
-    !await client.write_float(db, '${id}', ${value})
-    ??{ id: '${id}', f8:
-    ??$node
+[macro node_await_get_json id]
+    [invoke wait-for "await client.get_jsonb(db, '${id}')" "${id}" 10 $node]
+[endmacro]
+
+[macro node_await_get_enum id]
+    [invoke wait-for "await client.get_enum(db, '${id}')" "${id}" 10 $node]
+[endmacro]
+
+[macro node_await_get_blob id]
+    [invoke wait-for "await client.get_blob(db, '${id}')" "${id}" 10 $node]
 [endmacro]
 
 [macro node_get_uuid id]
@@ -68,15 +89,80 @@
     ??$node
 [endmacro]
 
-[macro node_get_int id expected_int2 expected_int4]
+[macro node_get_int id expected_int2 expected_int4 expected_int8]
     !await client.get_int(db, '${id}')
-    ??{ id: '${id}', i2: ${expected_int2}, i4: ${expected_int4} }
+    ??{ id: '${id}', i2: ${expected_int2}, i4: ${expected_int4}, i8: ${expected_int8}n }
     ??$node
 [endmacro]
 
-[macro node_get_float id expected_float8]
+[macro node_get_float id expected_float4 expected_float8]
     !await client.get_float(db, '${id}')
-    ??{ id: '${id}', f8: ${expected_float8} }
+    ??{ id: '${id}', f4: ${expected_float4}, f8: ${expected_float8} }
+    ??$node
+[endmacro]
+
+[macro node_get_json_raw id expected_json]
+    !await client.get_json_raw(db, '${id}')
+    ??${expected_json}
+    ??$node
+[endmacro]
+
+[macro node_get_jsonb_raw id expected_jsonb]
+    !await client.get_jsonb_raw(db, '${id}')
+    ??${expected_jsonb}
+    ??$node
+[endmacro]
+
+[macro node_get_json id expected_json]
+    !await client.get_json(db, '${id}')
+    ??{ id: '${id}', js: ${expected_json} }
+    ??$node
+[endmacro]
+
+[macro node_get_jsonb id expected_jsonb]
+    !await client.get_jsonb(db, '${id}')
+    ??{ id: '${id}', jsb: ${expected_jsonb} }
+    ??$node
+[endmacro]
+
+[macro node_get_enum id expected_enum]
+    !await client.get_enum(db, '${id}')
+    ??{ id: '${id}', c: ${expected_enum} }
+    ??$node
+[endmacro]
+
+[macro node_get_blob id expected_blob]
+    !await client.get_blob(db, '${id}')
+    ??{ id: '${id}', blob: ${expected_blob} }
+    ??$node
+[endmacro]
+
+[macro node_write_float id f4_value f8_value]
+    # Can write valid floats to the DB
+    !await client.write_float(db, '${id}', ${f4_value}, ${f8_value})
+    ??{ id: '${id}',
+    ??$node
+[endmacro]
+
+[macro node_write_enum id value]
+    # Can write valid enums to the DB
+    !await client.write_enum(db, '${id}', ${value})
+    ??{ id: '${id}', c: ${value} }
+    ??$node
+[endmacro]
+
+[macro node_write_json id json_value jsonb_value]
+    # Can write valid JSON to the DB
+    !await client.write_json(db, '${id}', ${json_value}, ${jsonb_value})
+    #??{ id: '${id}', js: ${json_value}, jsb: ${jsonb_value} }
+    # ??{ id: '${id}', jsb: ${jsonb_value} }
+    ??$node
+[endmacro]
+
+[macro node_write_blob id value]
+    # Can write valid blobs to the DB
+    !await client.write_blob(db, '${id}', ${value})
+    ??{ id: '${id}', blob:
     ??$node
 [endmacro]
 
@@ -109,13 +195,13 @@
     ??$node
 [endmacro]
 
-[macro node_await_insert_extended keys]
-    !await client.insert_extended_item(db, ${keys})
+[macro node_await_insert_extended obj]
+    !await client.insert_extended_item(db, ${obj})
     ??$node
 [endmacro]
 
-[macro node_await_insert_extended_into table keys]
-    !await client.insert_extended_into(db, '${table}', ${keys})
+[macro node_await_insert_extended_into table obj]
+    !await client.insert_extended_into(db, '${table}', ${obj})
     ??$node
 [endmacro]
 
@@ -124,10 +210,67 @@
 [endmacro]
 
 [macro node_await_insert_other keys]
-    !client.insert_other_item(db, ${keys})
+    !await client.insert_other_item(db, ${keys})
     ??$node
 [endmacro]
 
+[macro node_set_item_replication_transform]
+    !await client.set_item_replication_transform(db)
+    ??$node
+[endmacro]
+
+[macro node_sync_items filter]
+    !await client.syncItemsTable(db, "${filter}")
+[endmacro]
+
+[macro node_sync_other_items filter]
+    !await client.syncOtherItemsTable(db, "${filter}")
+[endmacro]
+
 [macro node_sync_table table]
-    !await client.syncTable(db, "${table}")
+    !await client.syncTable("${table}")
+[endmacro]
+
+# Makes both satellites and PG write rows
+[macro write sat1_msg sat2_msg pg_msg]
+    [shell satellite_1]
+        [invoke log "Insert data into satellite_1"]
+        [invoke node_await_insert "['$sat1_msg']"]
+    
+    [shell satellite_2]
+        [invoke log "Insert data into satellite_2"]
+        [invoke node_await_insert "['$sat2_msg']"]
+
+    [shell pg_1]
+        [invoke log "Insert a row on PG side"]
+        !INSERT INTO public.items (id, content) VALUES (gen_random_uuid(), '$pg_msg');
+        ?$psql
+[endmacro]
+
+# Reads the given rows on the satellites and PG
+[macro read sat1_msg sat2_msg pg_msg]
+    [shell pg_1]
+        [invoke log "Verify that pg has received data from both Satellites"]
+        [invoke wait-for "SELECT * FROM public.items;" "$sat1_msg" 15 $psql]
+        [invoke wait-for "SELECT * FROM public.items;" "$sat2_msg" 15 $psql]
+    
+    [invoke log "Verify that satellite inserts reached each other"]
+    [shell satellite_1]
+        [invoke wait-for "await client.get_items(db)" "$sat2_msg" 15 $node]
+    
+    [shell satellite_2]
+        [invoke wait-for "await client.get_items(db)" "$sat1_msg" 15 $node]
+    
+    [invoke log "Verify that pg insert has reached both Satellites"]
+    [shell satellite_1]
+        [invoke wait-for "await client.get_items(db)" "$pg_msg" 15 $node]
+    
+    [shell satellite_2]
+        [invoke wait-for "await client.get_items(db)" "$pg_msg" 15 $node]
+[endmacro]
+
+# Checks that the given rows sync between satellites and PG
+[macro test_sync sat1_msg sat2_msg pg_msg]
+    [invoke write "$sat1_msg" "$sat2_msg" "$pg_msg"]
+    [invoke read "$sat1_msg" "$sat2_msg" "$pg_msg"]
 [endmacro]

@@ -1,5 +1,107 @@
 # @core/electric
 
+## 0.10.1
+
+### Patch Changes
+
+- c8eec867: Fix handling NULL values when filtering replication stream
+
+## 0.10.0
+
+### Minor Changes
+
+- 284d987d: Introduce shapes with relation following on server and client
+
+### Patch Changes
+
+- f200734d: Fix the issue where the sync service would not sync any rows that had been present in a table before it was electrified.
+- 419e7b28: Fix unbounded disk usage growth caused by the WAL records retained by Electric's replication slot.
+- b7e99c88: Added support for BYTEA/BLOB column type across the sync service, TS client, and client generator
+- 378b1af1: fix: make sure the client is gracefully disconnected if PG is too slow on connection
+- 2394ec93: Include all publishable tables in the publication that Electric creates at startup.
+
+## 0.9.4
+
+### Patch Changes
+
+- 452361d5: Limit client connections when the sync service's Postgres connection is down.
+- 209192a3: [VAX-1664] Fix for prisma database introspection
+- 90735031: Create a publication in Postgres on startup. This would restore the replication stream from Postgres to Electric if the publication got deleted by accident.
+
+## 0.9.3
+
+### Patch Changes
+
+- 11069a90: Handle JWT expiration on the TS client, and support reconnecting after JWT expires.
+- 8f9bcb53: Deduplicate enum type definitions in the electrified schema.
+- 65aaeee5: Electric will now fail to start when a secure auth setting is used with AUTH_MODE=insecure.
+- 21a3a8c4: Pass the SSL options used for the main database connection to upstream connections established by the migrations proxy.
+- 0deba4d7: Validate public signing keys at startup. This allows for catching invalid key configuration early as opposed to getting an "invalid token signature" error when a client tries to authenticate.
+- b320bc16: Changed how the DDL statements for electrified enum columns are stored internally. This change requires resetting the database if it has at least one electrified enum column.
+- 0deba4d7: Accept base64-encoded symmetric signing keys. Electric will detect and decode such keys automatically. Binary keys are also accepted as before.
+- 9ed7b728: Reject electrification of tables outside of the public schema. This is a documented limitation that is now also enforced in the code.
+- c037fdd9: Enable SSL certificate validation for database connections when DATABASE_REQUIRE_SSL=true.
+
+## 0.9.2
+
+### Patch Changes
+
+- 3a78a767: Removes unnecessary comma in conflict resolution PG trigger shadow table update query
+- 6fc36865: Upgrade the build environment to use Erlang (25.3.2.8) and Elixir (1.16.1).
+- 6fc36865: Include the Server Name Indication (SNI) SSL option when connecting to the database. This makes it possible for Electric to connect to Neon (neon.tech).
+- 210b9e36: Support JWTs without a trailing dot in the Insecure auth mode. (#900)
+
+## 0.9.1
+
+### Patch Changes
+
+- 30179e87: [VAX-1553] Add support for AuthenticationMD5Password upstream auth method in the Migrations proxy. This fixes a connectivity issue between Electric and DigitalOcean Managed PostgreSQL.
+- dd27d6a1: [VAX-1543] Add support for the sslmode query option in DATABASE_URL.
+
+## 0.9.0
+
+### Minor Changes
+
+- df56221b: Reject electrification of tables that have no PRIMARY KEY or include unsupported constraints. Only PRIMARY KEY and FOREIGN KEY constraints are currently supported.
+- 3a7fb38b: Validate table column types and constraints for new columns that are added to electrified tables with ALTER TABLE ... ADD COLUMN.
+- afa4f839: Reject ALTER TABLE ... ADD COLUMN statements that try to add a new foreign key to an already electrified table.
+
+### Patch Changes
+
+- 07499d3e: Format some known errors in an easy-to-read way, including more context and information about resolution in the error messages.
+- 4fe5c7f6: [VAX-1040] [VAX-1041] [VAX-1042] Add support for user-defined enum types in electrified tables.
+- 2ac82759: Validate config values and print all missing or invalid config options at Electirc startup.
+- d386fd98: Try connecting to the database over IPv6 and IPv4, in that order, and use the first option that works. This obviates the need for the DATABASE_USE_IPV6 configuration setting in most cases.
+- e8bb9a8f: Enforce the use of SSL for database connections by default.
+- 82202278: [VAX-1449] Add the notion of "clock drift" to Electric and use it when validating timestamps in auth tokens. Among other things, this fixes the issue where an auth token is used to authenticate with Electric before even a second passes after it was generated.
+- 743c5d07: Configure the sync service using dev.env and test.env files in development and testing.
+
+## 0.8.1
+
+### Patch Changes
+
+- 0dfb35d8: [VAX-1324] Prevent updates to table PKs
+- a3d4bfe2: Electric now opens all its ports to listen both on IPv4- and IPv6-capable interfaces. This obviates the need for the ELECTRIC_USE_IPV6 configuration setting in most cases.
+- 34a89b4a: Automatically publish electricsql/electric:canary images to Docker Hub on every push to main.
+- b57ec927: [VAX-1417] Add the option to tunnel TCP connections to the migrations proxy over regular WebSocket connections.
+- 34a89b4a: Log the version of the Electric sync service on startup.
+- 11878e74: Log a descriptive error message when Electric fails to open a replication connection to Postgres.
+- ddb70c97: [VAX-1374] Add a new write-to-pg mode that applies client updates as DML statements as opposed to streaming them to Postgres over a logical replication connection.
+
+## 0.8.0
+
+### Minor Changes
+
+- eb722c9b: [VAX-1335] Create new protocol op to represent a compensation
+
+### Patch Changes
+
+- 0dc61662: [VAX-820, VAX-1325] Add support for the BIGINT / INT8 column type in electrified tables.
+- d9efe923: [VAX-1264, VAX-1265] Fix some edge cases in the parsing of DATABASE_URL.
+- 4ad7df4d: [VAX-825] Add support for the JSONB column type in electrified tables.
+- b6e589d3: [VAX-846, VAX-849] Add support for the REAL / FLOAT4 column type in electrified tables.
+- 96e75630: Swap to using `sub` claim in jwt, backwards compatible with `user_id`.
+
 ## 0.7.1
 
 ### Patch Changes

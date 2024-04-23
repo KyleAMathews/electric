@@ -1,0 +1,18 @@
+CREATE OR REPLACE FUNCTION <%= schema() %>.generate_electrified_sql(table_oid regclass)
+RETURNS text[]
+SECURITY DEFINER
+AS $function$
+DECLARE
+    _col_type regtype;
+    _ddl_statements text[];
+BEGIN
+    SELECT array_agg(<%= schema() %>.ddlgen_create(atttypid) ORDER BY attnum)
+        FROM pg_attribute
+        JOIN pg_type on atttypid = pg_type.oid
+        WHERE attrelid = table_oid AND attnum > 0 AND NOT attisdropped AND typtype = 'e'
+    INTO _ddl_statements;
+
+    RETURN array_append(_ddl_statements, (SELECT <%= schema() %>.ddlgen_create(table_oid)));
+END;
+$function$
+LANGUAGE PLPGSQL;

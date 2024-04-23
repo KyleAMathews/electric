@@ -46,16 +46,13 @@ export const ElectricWrapper = ({ children }) => {
   const [ electric, setElectric ] = useState<Electric>()
 
   useEffect(() => {
-    const isMounted = true
+    let isMounted = true
 
     const init = async () => {
-      const config = {
-        auth: {
-          token: insecureAuthToken({user_id: 'dummy'})
-        }
-      }
-      const conn = await ElectricDatabase.init('electric.db', '')
-      const electric = await electrify(conn, schema, config)
+      const conn = await ElectricDatabase.init('electric.db')
+      const electric = await electrify(conn, schema)
+      const token = insecureAuthToken({sub: 'dummy'})
+      await electric.connect(token)
 
       if (!isMounted) {
         return
@@ -100,7 +97,7 @@ const ExampleComponent = () => {
   const [ value, setValue ] = useState()
 
   const generate = async () => {
-    const { newValue } = await db.raw({
+    const { newValue } = await db.rawQuery({
       sql: 'select random() as newValue'
     })
 
@@ -140,7 +137,7 @@ const Component = () => {
 
   // Use the raw SQL API.
   const { results: countResults } = useLiveQuery(
-    db.liveRaw({
+    db.liveRawQuery({
       sql: 'select count(*) from items'
     })
   )
@@ -181,31 +178,31 @@ With a signature of:
 ```tsx
 import { LiveResultContext } from 'electric-sql/client/model/model'
 
-export interface ResultData<T> {
-  error?: unknown
+export interface LiveResultUpdate<T> {
   results?: T
+  error?: unknown
   updatedAt?: Date
 }
 
-function successResult<T>(results: T): ResultData<T> {
+function successResult<T>(results: T): LiveResultUpdate<T> {
   return {
-    error: undefined,
     results: results,
+    error: undefined,
     updatedAt: new Date(),
   }
 }
 
-function errorResult<T>(error: unknown): ResultData<T> {
+function errorResult<T>(error: unknown): LiveResultUpdate<T> {
   return {
-    error: error,
     results: undefined,
+    error: error,
     updatedAt: new Date(),
   }
 }
 
 function useLiveQuery<Res>(
   runQuery: LiveResultContext<Res>
-): ResultData<Res>
+): LiveResultUpdate<Res>
 ```
 
 Running the query successfully will assign a new array of rows to the `results` and `error` will be `undefined`. Or if the query errors, the error will be assigned to the `error` variable and `results` will be `undefined`. The `updatedAt` variable is a [Date](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date) instance set when the return value last changed. Which is either when the query is first run or whenever it's re-run following a data change event.
@@ -219,7 +216,7 @@ The live query is re-run:
 1. when any of the data in any of the tables it depends on changes
 2. when any of the query parameters change
 
-By default, `useLiveQuery` detects query parameter changes by comparing an [ohash](https://github.com/unjs/ohash) of the whole query paramter object. So in this case, an hash of the `{where: {status: ...}}` object.
+By default, `useLiveQuery` detects query parameter changes by comparing an [ohash](https://github.com/unjs/ohash) of the whole query parameter object. So in this case, an hash of the `{where: {status: ...}}` object.
 
 ```tsx
 const Component = () => {
@@ -262,26 +259,24 @@ Note that with this usage, the first argument wraps the `db.projects.liveMany()`
 function useLiveQuery<Res>(
   runQueryFn: () => LiveResultContext<Res>,
   dependencies: DependencyList
-): ResultData<Res>
+): LiveResultUpdate<Res>
 ```
 
 ### `useConnectivityState`
 
-`useConnectivityState` binds the current connectivity status of the Satellite replication process for the electrified database client to a state variable and provides a function to toggle it between connected and disconnected:
+`useConnectivityState` binds the current connectivity status of the Satellite replication process for the electrified database client to a state variable:
 
 ```tsx
 import React from 'react'
 import { useConnectivityState } from 'electric-sql/react'
 
-const ConnectivityControl = () => {
-  const { connectivityState, toggleConnectivityState } = useConnectivityState()
+const ConnectivityMonitor = () => {
+  const connectivityState = useConnectivityState()
 
   return (
-    <a onMouseDown={ toggleConnectivityState }>
-      <span className="capitalize">
-        { connectivityState }
-      </span>
-    </a>
+    <span className="capitalize">
+      { connectivityState }
+    </span>
   )
 }
 ```

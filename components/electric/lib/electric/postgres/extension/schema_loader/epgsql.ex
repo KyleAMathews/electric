@@ -9,7 +9,7 @@ defmodule Electric.Postgres.Extension.SchemaLoader.Epgsql do
   defmodule ConnectionPool do
     @moduledoc false
 
-    alias Electric.Replication.Connectors
+    alias Electric.Replication.{Connectors, Postgres.Client}
 
     require Logger
 
@@ -17,7 +17,6 @@ defmodule Electric.Postgres.Extension.SchemaLoader.Epgsql do
 
     @impl NimblePool
     def init_worker(conn_config) do
-      Logger.debug("Starting SchemaLoader pg connection: #{inspect(conn_config)}")
       # NOTE: use `__connection__: conn` in tests to pass an existing connection
       {:ok, conn} =
         case Keyword.fetch(conn_config, :__connection__) do
@@ -27,8 +26,7 @@ defmodule Electric.Postgres.Extension.SchemaLoader.Epgsql do
           :error ->
             conn_config
             |> Connectors.get_connection_opts()
-            |> Electric.Utils.epgsql_config()
-            |> :epgsql.connect()
+            |> Client.connect()
         end
 
       {:ok, conn, conn_config}
@@ -48,7 +46,7 @@ defmodule Electric.Postgres.Extension.SchemaLoader.Epgsql do
     @impl NimblePool
     def terminate_worker(_reason, conn, pool_state) do
       Logger.debug("Terminating idle db connection #{inspect(conn)}")
-      :epgsql.close(conn)
+      Client.close(conn)
       {:ok, pool_state}
     end
 
@@ -93,14 +91,18 @@ defmodule Electric.Postgres.Extension.SchemaLoader.Epgsql do
   @impl true
   def load(pool) do
     checkout!(pool, fn conn ->
-      Extension.current_schema(conn)
+      with {:ok, version, schema} <- Extension.current_schema(conn) do
+        {:ok, SchemaLoader.Version.new(version, schema)}
+      end
     end)
   end
 
   @impl true
   def load(pool, version) do
     checkout!(pool, fn conn ->
-      Extension.schema_version(conn, version)
+      with {:ok, version, schema} <- Extension.schema_version(conn, version) do
+        {:ok, SchemaLoader.Version.new(version, schema)}
+      end
     end)
   end
 
@@ -108,7 +110,7 @@ defmodule Electric.Postgres.Extension.SchemaLoader.Epgsql do
   def save(pool, version, schema, stmts) do
     checkout!(pool, fn conn ->
       with :ok <- Extension.save_schema(conn, version, schema, stmts) do
-        {:ok, pool}
+        {:ok, pool, SchemaLoader.Version.new(version, schema)}
       end
     end)
   end
@@ -121,35 +123,6 @@ defmodule Electric.Postgres.Extension.SchemaLoader.Epgsql do
   def relation_oid(pool, rel_type, schema, table) do
     checkout!(pool, fn conn ->
       Client.relation_oid(conn, rel_type, schema, table)
-    end)
-  end
-
-  @primary_keys_query """
-  SELECT a.attname
-  FROM pg_class c
-    INNER JOIN pg_namespace n ON c.relnamespace = n.oid
-    INNER JOIN pg_index i ON i.indrelid = c.oid
-    INNER JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-  WHERE
-      n.nspname = $1
-      AND c.relname = $2
-      AND c.relkind = 'r'
-      AND i.indisprimary
-  """
-
-  @impl true
-  def primary_keys(pool, schema, name) do
-    checkout!(pool, fn conn ->
-      {:ok, _, pks_data} = :epgsql.equery(conn, @primary_keys_query, [schema, name])
-
-      {:ok, Enum.map(pks_data, &elem(&1, 0))}
-    end)
-  end
-
-  @impl true
-  def primary_keys(pool, {schema, name}) do
-    checkout!(pool, fn conn ->
-      primary_keys(conn, schema, name)
     end)
   end
 

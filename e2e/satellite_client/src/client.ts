@@ -1,12 +1,14 @@
 import Database from 'better-sqlite3'
 import { ElectricConfig } from 'electric-sql'
 import { mockSecureAuthToken } from 'electric-sql/auth/secure'
-
 import { setLogLevel } from 'electric-sql/debug'
 import { electrify } from 'electric-sql/node'
 import { v4 as uuidv4 } from 'uuid'
-import { schema, Electric } from './generated/client'
+import { schema, Electric, ColorType as Color } from './generated/client'
+export { JsonNull } from './generated/client'
 import { globalRegistry } from 'electric-sql/satellite'
+import { SatelliteErrorCode } from 'electric-sql/util'
+import { Shape } from 'electric-sql/satellite'
 
 setLogLevel('DEBUG')
 
@@ -21,60 +23,99 @@ export const electrify_db = async (
   db: any,
   host: string,
   port: number,
-  migrations: any
+  migrations: any,
+  connectToElectric: boolean,
+  exp?: string
 ): Promise<Electric> => {
   const config: ElectricConfig = {
     url: `electric://${host}:${port}`,
     debug: true,
-    auth: {
-      token: await mockSecureAuthToken()
-    }
   }
   console.log(`(in electrify_db) config: ${JSON.stringify(config)}`)
   schema.migrations = migrations
   const result = await electrify(db, schema, config)
+  const token = await mockSecureAuthToken(exp)
 
-  result.notifier.subscribeToConnectivityStateChanges((x) => console.log("Connectivity state changed", x))
+  result.notifier.subscribeToConnectivityStateChanges((x: any) => console.log(`Connectivity state changed: ${x.connectivityState.status}`))
+  if (connectToElectric) {
+    await result.connect(token) // connect to Electric
+  }
 
   return result
 }
 
+export const disconnect = async (electric: Electric) => {
+  await electric.disconnect()
+}
+
+// reconnects with Electric, e.g. after expiration of the JWT
+export const reconnect = async (electric: Electric, exp: string) => {
+  const token = await mockSecureAuthToken(exp)
+  await electric.connect(token)
+}
+
+export const check_token_expiration = (electric: Electric, minimalTime: number) => {
+  const start = Date.now()
+  const unsubscribe = electric.notifier.subscribeToConnectivityStateChanges((x: any) => {
+    if (x.connectivityState.status === 'disconnected' && x.connectivityState.reason?.code === SatelliteErrorCode.AUTH_EXPIRED) {
+      const delta = Date.now() - start
+      if (delta >= minimalTime) {
+        console.log(`JWT expired after ${delta} ms`)
+      }
+      else {
+        console.log(`JWT expired too early, after only ${delta} ms`)
+      }
+      unsubscribe()
+    }
+  })
+}
+
 export const set_subscribers = (db: Electric) => {
-  db.notifier.subscribeToAuthStateChanges((x) => {
+  db.notifier.subscribeToAuthStateChanges((x: any) => {
     console.log('auth state changes: ')
     console.log(x)
   })
-  db.notifier.subscribeToPotentialDataChanges((x) => {
+  db.notifier.subscribeToPotentialDataChanges((x: any) => {
     console.log('potential data change: ')
     console.log(x)
   })
-  db.notifier.subscribeToDataChanges((x) => {
+  db.notifier.subscribeToDataChanges((x: any) => {
     console.log('data changes: ')
     console.log(JSON.stringify(x))
   })
 }
 
-export const syncTable = async (electric: Electric, table: string) => {
-  if (table === 'other_items') {
-    const { synced } = await electric.db.other_items.sync({ include: { items: true } })
-    return await synced
-  } else {
-    const satellite = globalRegistry.satellites[dbName]
-    const { synced } = await satellite.subscribe([{selects: [{tablename: table}]}])
-    return await synced
-  }
+export const syncItemsTable = async (electric: Electric, shapeFilter: string) => {
+  const { synced } = await electric.db.items.sync({ where: shapeFilter })
+  return await synced
+}
+
+export const syncOtherItemsTable = async (electric: Electric, shapeFilter: string) => {
+  const { synced } = await electric.db.other_items.sync({ where: shapeFilter })
+  return await synced
+}
+
+export const syncTable = async (table: string) => {
+  const satellite = globalRegistry.satellites[dbName]
+  const { synced } = await satellite.subscribe([{ tablename: table }])
+  return await synced
+}
+
+export const lowLevelSubscribe = async (electric: Electric, shape: Shape) => {
+  const { synced } = await electric.satellite.subscribe([shape])
+  return await synced
 }
 
 export const get_tables = (electric: Electric) => {
-  return electric.db.raw({ sql: `SELECT name FROM sqlite_master WHERE type='table';` })
+  return electric.db.rawQuery({ sql: `SELECT name FROM sqlite_master WHERE type='table';` })
 }
 
 export const get_columns = (electric: Electric, table: string) => {
-  return electric.db.raw({ sql: `SELECT * FROM pragma_table_info(?);`, args: [table] })
+  return electric.db.rawQuery({ sql: `SELECT * FROM pragma_table_info(?);`, args: [table] })
 }
 
 export const get_rows = (electric: Electric, table: string) => {
-  return electric.db.raw({sql: `SELECT * FROM ${table};`})
+  return electric.db.rawQuery({ sql: `SELECT * FROM ${table};` })
 }
 
 export const get_timestamps = (electric: Electric) => {
@@ -96,7 +137,7 @@ export const write_datetime = (electric: Electric, datetime: Datetime) => {
   })
 }
 
-export const get_timestamp = (electric: Electric, id: string): Promise<Timestamp | undefined> => {
+export const get_timestamp = (electric: Electric, id: string) => {
   return electric.db.timestamps.findUnique({
     where: {
       id: id
@@ -104,7 +145,7 @@ export const get_timestamp = (electric: Electric, id: string): Promise<Timestamp
   })
 }
 
-export const get_datetime = async (electric: Electric, id: string): Promise<Datetime | undefined> => {
+export const get_datetime = async (electric: Electric, id: string) => {
   const datetime = await electric.db.datetimes.findUnique({
     where: {
       id: id
@@ -124,13 +165,13 @@ export const assert_datetime = async (electric: Electric, id: string, expectedDa
   return check_datetime(datetime, expectedDate, expectedTime)
 }
 
-export const check_timestamp = (timestamp: Timestamp | undefined, expectedCreatedAt: string, expectedUpdatedAt: string) => {
+export const check_timestamp = (timestamp: Timestamp | null, expectedCreatedAt: string, expectedUpdatedAt: string) => {
   return (timestamp ?? false) &&
     timestamp!.created_at.getTime() === new Date(expectedCreatedAt).getTime() &&
     timestamp!.updated_at.getTime() === new Date(expectedUpdatedAt).getTime()
 }
 
-export const check_datetime = (datetime: Datetime | undefined, expectedDate: string, expectedTime: string) => {
+export const check_datetime = (datetime: Datetime | null, expectedDate: string, expectedTime: string) => {
   return (datetime ?? false) &&
     datetime!.d.getTime() === new Date(expectedDate).getTime() &&
     datetime!.t.getTime() === new Date(expectedTime).getTime()
@@ -145,13 +186,13 @@ export const write_bool = (electric: Electric, id: string, b: boolean) => {
   })
 }
 
-export const get_bool = async (electric: Electric, id: string): Promise<boolean> => {
+export const get_bool = async (electric: Electric, id: string) => {
   const row = await electric.db.bools.findUnique({
     where: {
       id: id
     },
   })
-  return row.b
+  return row?.b
 }
 
 export const get_datetimes = (electric: Electric) => {
@@ -198,13 +239,9 @@ export const get_int = (electric: Electric, id: string) => {
   })
 }
 
-export const write_int = (electric: Electric, id: string, i2: number, i4: number) => {
+export const write_int = (electric: Electric, id: string, i2: number, i4: number, i8: number | bigint) => {
   return electric.db.ints.create({
-    data: {
-      id,
-      i2,
-      i4,
-    }
+    data: { id, i2, i4, i8 }
   })
 }
 
@@ -216,17 +253,104 @@ export const get_float = (electric: Electric, id: string) => {
   })
 }
 
-export const write_float = (electric: Electric, id: string, f8: number) => {
+export const write_float = (electric: Electric, id: string, f4: number, f8: number) => {
   return electric.db.floats.create({
     data: {
       id,
+      f4,
       f8,
     }
   })
 }
 
+export const get_json_raw = async (electric: Electric, id: string) => {
+  const res = await electric.db.rawQuery({
+    sql: `SELECT js FROM jsons WHERE id = ?;`,
+    args: [id]
+  }) as unknown as Array<{ js: string }>
+  return res[0]?.js
+}
+
+export const get_jsonb_raw = async (electric: Electric, id: string) => {
+  const res = await electric.db.rawQuery({
+    sql: `SELECT jsb FROM jsons WHERE id = ?;`,
+    args: [id]
+  }) as unknown as Array<{ jsb: string }>
+  return res[0]?.jsb
+}
+
+export const get_json = async (electric: Electric, id: string) => {
+  const res = await electric.db.jsons.findUnique({
+    where: {
+      id: id
+    },
+    select: {
+      id: true,
+      js: true,
+    }
+  })
+  return res
+}
+
+export const get_jsonb = async (electric: Electric, id: string) => {
+  const res = await electric.db.jsons.findUnique({
+    where: {
+      id: id
+    },
+    select: {
+      id: true,
+      jsb: true,
+    }
+  })
+  return res
+}
+
+export const write_json = async (electric: Electric, id: string, js: any, jsb: any) => {
+  return electric.db.jsons.create({
+    data: {
+      id,
+      //js,
+      jsb,
+    }
+  })
+}
+
+export const get_enum = (electric: Electric, id: string) => {
+  return electric.db.enums.findUnique({
+    where: {
+      id: id
+    }
+  })
+}
+
+export const write_enum = (electric: Electric, id: string, c: Color | null) => {
+  return electric.db.enums.create({
+    data: {
+      id,
+      c,
+    }
+  })
+}
+
+export const get_blob = async (electric: Electric, id: string) => {
+  return electric.db.blobs.findUnique({
+    where: {
+      id: id
+    }
+  })
+}
+
+export const write_blob = (electric: Electric, id: string, blob: Uint8Array | null) => {
+  return electric.db.blobs.create({
+    data: {
+      id,
+      blob,
+    }
+  })
+}
+
 export const get_item_columns = (electric: Electric, table: string, column: string) => {
-  return electric.db.raw({ sql: `SELECT ${column} FROM ${table};` })
+  return electric.db.rawQuery({ sql: `SELECT ${column} FROM ${table};` })
 }
 
 export const insert_item = async (electric: Electric, keys: [string]) => {
@@ -242,11 +366,11 @@ export const insert_item = async (electric: Electric, keys: [string]) => {
   })
 }
 
-export const insert_extended_item = async (electric: Electric, values: { string: string }) => {
+export const insert_extended_item = async (electric: Electric, values: Record<string, string>) => {
   await insert_extended_into(electric, "items", values)
 }
 
-export const insert_extended_into = async (electric: Electric, table: string, values: { string: string }) => {
+export const insert_extended_into = async (electric: Electric, table: string, values: Record<string, string>) => {
   if (!values['id']) {
     values['id'] = uuidv4()
   }
@@ -255,7 +379,7 @@ export const insert_extended_into = async (electric: Electric, table: string, va
   const placeHolders = Array(columns.length).fill("?")
   const args = Object.values(values)
 
-  await electric.db.raw({
+  await electric.db.unsafeExec({
     sql: `INSERT INTO ${table} (${columnNames}) VALUES (${placeHolders}) RETURNING *;`,
     args: args,
   })
@@ -283,13 +407,6 @@ export const insert_other_item = async (electric: Electric, keys: [string]) => {
     }
   })
 
-  await electric.db.items.create({
-    data: {
-      id: "test_id_1",
-      content: ""
-    }
-  })
-
   await electric.db.other_items.createMany({
     data: items
   })
@@ -303,6 +420,20 @@ export const delete_other_item = async (electric: Electric, keys: [string]) => {
       }
     })
   }
+}
+
+export const set_item_replication_transform = (electric: Electric) => {
+  electric.db.items.setReplicationTransform({
+    transformOutbound: (item) => ({
+      ...item,
+      content: item.content.split('').map((char) => String.fromCharCode(char.charCodeAt(0) + 1)).join('')
+    }),
+    transformInbound: (item) => ({
+      ...item,
+      content: item.content.split('').map((char) => String.fromCharCode(char.charCodeAt(0) - 1)).join('')
+    })
+
+  })
 }
 
 export const stop = async () => {

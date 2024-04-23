@@ -1,14 +1,13 @@
+import 'global-jsdom/register'
 // https://react-hooks-testing-library.com/usage/advanced-hooks#context
 import anyTest, { TestFn } from 'ava'
 
-import browserEnv from '@ikscodes/browser-env'
-browserEnv()
-
 import React from 'react'
+import { EventEmitter } from 'events'
 import { act, renderHook, waitFor } from '@testing-library/react'
 
-import { DatabaseAdapter } from '../../src/drivers/react-native-sqlite-storage/adapter'
-import { MockDatabase } from '../../src/drivers/react-native-sqlite-storage/mock'
+import { DatabaseAdapter } from '../../src/drivers/wa-sqlite/adapter'
+import { MockDatabase } from '../../src/drivers/wa-sqlite/mock'
 
 import { MockNotifier } from '../../src/notifiers/mock'
 import { QualifiedTablename } from '../../src/util/tablename'
@@ -21,13 +20,14 @@ import {
 import { makeElectricContext } from '../../src/frameworks/react/provider'
 import { ElectricClient } from '../../src/client/model/client'
 import { schema, Electric } from '../client/generated'
-import { MockSatelliteProcess } from '../../src/satellite/mock'
+import { MockRegistry, MockSatelliteProcess } from '../../src/satellite/mock'
 import { Migrator } from '../../src/migrators'
 import { SocketFactory } from '../../src/sockets'
 import { SatelliteOpts } from '../../src/satellite/config'
 import { Notifier } from '../../src/notifiers'
+import { createQueryResultSubscribeFunction } from '../../src/util'
 
-const assert = (stmt: any, msg: string = 'Assertion failed.'): void => {
+const assert = (stmt: unknown, msg = 'Assertion failed.'): void => {
   if (!stmt) {
     throw new Error(msg)
   }
@@ -46,8 +46,8 @@ const test = anyTest as TestFn<{
 
 test.beforeEach((t) => {
   const original = new MockDatabase('test.db')
-  const adapter = new DatabaseAdapter(original, false)
-  const notifier = new MockNotifier('test.db')
+  const adapter = new DatabaseAdapter(original)
+  const notifier = new MockNotifier('test.db', new EventEmitter())
   const satellite = new MockSatelliteProcess(
     'test.db',
     adapter,
@@ -56,7 +56,15 @@ test.beforeEach((t) => {
     {} as SocketFactory,
     {} as SatelliteOpts
   )
-  const dal = ElectricClient.create(schema, adapter, notifier, satellite)
+  const registry = new MockRegistry()
+  const dal = ElectricClient.create(
+    'test.db',
+    schema,
+    adapter,
+    notifier,
+    satellite,
+    registry
+  )
 
   dal.db.Items.sync()
 
@@ -64,7 +72,8 @@ test.beforeEach((t) => {
 })
 
 test('liveFirst arguments are optional', async (t) => {
-  const { dal } = t.context
+  const { dal, adapter } = t.context
+  adapter._query = async () => [{ value: 'potato' }]
 
   const liveQuery = dal.db.Items.liveFirst() // this one already fails because later down `result.current` contains an error...
 
@@ -82,7 +91,8 @@ test('liveFirst arguments are optional', async (t) => {
 })
 
 test('liveMany arguments are optional', async (t) => {
-  const { dal } = t.context
+  const { dal, adapter } = t.context
+  adapter._query = async () => [{ value: 'potato' }]
 
   const liveQuery = dal.db.Items.liveMany() // this one already fails because later down `result.current` contains an error...
 
@@ -103,7 +113,7 @@ test('useLiveQuery returns query results', async (t) => {
   const { dal, adapter } = t.context
 
   const query = 'select i from bars'
-  const liveQuery = dal.db.liveRaw({
+  const liveQuery = dal.db.liveRawQuery({
     sql: query,
   })
 
@@ -118,13 +128,22 @@ test('useLiveQuery returns query results', async (t) => {
 })
 
 test('useLiveQuery returns error when query errors', async (t) => {
-  const { dal } = t.context
+  const { notifier, dal } = t.context
 
   const wrapper: FC = ({ children }) => {
     return <ElectricProvider db={dal}>{children}</ElectricProvider>
   }
 
-  const { result } = renderHook(() => useLiveQuery(mockLiveQueryError), {
+  const errorLiveQuery = async () => {
+    throw new Error('Mock query error')
+  }
+
+  errorLiveQuery.subscribe = createQueryResultSubscribeFunction(
+    notifier,
+    errorLiveQuery
+  )
+
+  const { result } = renderHook(() => useLiveQuery(errorLiveQuery), {
     wrapper,
   })
 
@@ -138,7 +157,7 @@ test('useLiveQuery re-runs query when data changes', async (t) => {
   const { dal, notifier } = t.context
 
   const query = 'select foo from bars'
-  const liveQuery = dal.db.liveRaw({
+  const liveQuery = dal.db.liveRawQuery({
     sql: query,
   })
 
@@ -157,7 +176,7 @@ test('useLiveQuery re-runs query when data changes', async (t) => {
     const qtn = new QualifiedTablename('main', 'bars')
     const changes = [{ qualifiedTablename: qtn }]
 
-    notifier.actuallyChanged('test.db', changes)
+    notifier.actuallyChanged('test.db', changes, 'local')
   })
 
   await waitFor(() => assert(result.current.updatedAt! > updatedAt!), {
@@ -176,7 +195,7 @@ test('useLiveQuery re-runs query when *aliased* data changes', async (t) => {
   }
 
   const query = 'select foo from baz.bars'
-  const liveQuery = dal.db.liveRaw({
+  const liveQuery = dal.db.liveRawQuery({
     sql: query,
   })
 
@@ -191,7 +210,7 @@ test('useLiveQuery re-runs query when *aliased* data changes', async (t) => {
     const qtn = new QualifiedTablename('main', 'bars')
     const changes = [{ qualifiedTablename: qtn }]
 
-    notifier.actuallyChanged('baz.db', changes)
+    notifier.actuallyChanged('baz.db', changes, 'local')
   })
 
   await waitFor(() => assert(result.current.updatedAt! > updatedAt!), {
@@ -204,7 +223,7 @@ test('useLiveQuery never sets results if unmounted immediately', async (t) => {
   const { dal } = t.context
 
   const query = 'select foo from bars'
-  const liveQuery = dal.db.liveRaw({
+  const liveQuery = dal.db.liveRawQuery({
     sql: query,
   })
 
@@ -225,7 +244,7 @@ test('useLiveQuery unsubscribes to data changes when unmounted', async (t) => {
   const { dal, notifier } = t.context
 
   const query = 'select foo from bars'
-  const liveQuery = dal.db.liveRaw({
+  const liveQuery = dal.db.liveRawQuery({
     sql: query,
   })
 
@@ -249,7 +268,7 @@ test('useLiveQuery unsubscribes to data changes when unmounted', async (t) => {
     const qtn = new QualifiedTablename('main', 'bars')
     const changes = [{ qualifiedTablename: qtn }]
 
-    notifier.actuallyChanged('test.db', changes)
+    notifier.actuallyChanged('test.db', changes, 'local')
   })
 
   await sleepAsync(1000)
@@ -260,14 +279,18 @@ test('useLiveQuery ignores results if unmounted whilst re-querying', async (t) =
   const { dal, notifier } = t.context
 
   const query = 'select foo from bars'
-  const liveQuery = dal.db.liveRaw({
+  const liveQuery = dal.db.liveRawQuery({
     sql: query,
   })
   const slowLiveQuery = async () => {
     await sleepAsync(100)
-
     return await liveQuery()
   }
+
+  slowLiveQuery.subscribe = createQueryResultSubscribeFunction(
+    notifier,
+    slowLiveQuery
+  )
 
   const wrapper: FC = ({ children }) => {
     return <ElectricProvider db={dal}>{children}</ElectricProvider>
@@ -287,7 +310,7 @@ test('useLiveQuery ignores results if unmounted whilst re-querying', async (t) =
     const qtn = new QualifiedTablename('main', 'bars')
     const changes = [{ qualifiedTablename: qtn }]
 
-    notifier.actuallyChanged('test.db', changes)
+    notifier.actuallyChanged('test.db', changes, 'local')
     unmount()
   })
 
@@ -304,10 +327,8 @@ test('useConnectivityState defaults to disconnected', async (t) => {
 
   const { result } = renderHook(() => useConnectivityState(), { wrapper })
 
-  await waitFor(() =>
-    assert(result.current.connectivityState === 'disconnected')
-  )
-  t.is(result.current.connectivityState, 'disconnected')
+  await waitFor(() => assert(result.current.status === 'disconnected'))
+  t.is(result.current.status, 'disconnected')
 })
 
 test('useConnectivityState handles connectivity events', async (t) => {
@@ -319,10 +340,10 @@ test('useConnectivityState handles connectivity events', async (t) => {
 
   const { result } = renderHook(() => useConnectivityState(), { wrapper })
 
-  notifier.connectivityStateChanged('test.db', 'connected')
+  notifier.connectivityStateChanged('test.db', { status: 'connected' })
 
-  await waitFor(() => assert(result.current.connectivityState === 'connected'))
-  t.is(result.current.connectivityState, 'connected')
+  await waitFor(() => assert(result.current.status === 'connected'))
+  t.is(result.current.status, 'connected')
 })
 
 test('useConnectivityState ignores connectivity events after unmounting', async (t) => {
@@ -332,21 +353,17 @@ test('useConnectivityState ignores connectivity events after unmounting', async 
     return <ElectricProvider db={dal}>{children}</ElectricProvider>
   }
 
-  notifier.connectivityStateChanged('test.db', 'disconnected')
+  notifier.connectivityStateChanged('test.db', { status: 'disconnected' })
 
   const { result, unmount } = renderHook(() => useConnectivityState(), {
     wrapper,
   })
-  t.is(result.current.connectivityState, 'disconnected')
+  t.is(result.current.status, 'disconnected')
 
   unmount()
 
-  notifier.connectivityStateChanged('test.db', 'connected')
+  notifier.connectivityStateChanged('test.db', { status: 'connected' })
 
   await sleepAsync(1000)
-  t.is(result.current.connectivityState, 'disconnected')
+  t.is(result.current.status, 'disconnected')
 })
-
-const mockLiveQueryError = async () => {
-  throw new Error('Mock query error')
-}

@@ -17,11 +17,7 @@ const db = new Database(':memory:')
 const electric = await electrify(
   db,
   schema,
-  {
-    auth: {
-      token: 'test-token',
-    },
-  },
+  {},
   { registry: new MockRegistry() }
 )
 
@@ -35,11 +31,15 @@ const tbl = electric.db.Post
 const postTable = tbl
 const userTable = electric.db.User
 const profileTable = electric.db.Profile
+const imageTable = electric.db.ProfileImage
 
 // Sync all shapes such that we don't get warnings on every query
-await postTable.sync()
-await userTable.sync()
-await profileTable.sync()
+await Promise.all([
+  postTable.sync(),
+  userTable.sync(),
+  profileTable.sync(),
+  imageTable.sync(),
+])
 
 const post1 = {
   id: 1,
@@ -70,24 +70,39 @@ const post3 = {
 const author1 = {
   id: 1,
   name: 'alice',
+  meta: null,
 }
 
 const profile1 = {
   id: 1,
   bio: 'bio 1',
+  meta: null,
   userId: 1,
+  imageId: null,
 }
 
 const author2 = {
   id: 2,
   name: 'bob',
+  meta: 'information',
+}
+
+const image1 = {
+  id: 'image-1',
+  image: new Uint8Array([1, 2, 3]),
 }
 
 const profile2 = {
   id: 2,
   bio: 'bio 2',
+  meta: { foo: 3 },
   userId: 2,
+  imageId: image1.id,
 }
+
+// An invalid JSON that will throw if `JSON.parse()` is called
+// on it - the valid string literal would be "'invalid json"'
+const invalidJson = 'invalid json'
 
 const sortById = <T extends { id: number }>(arr: Array<T>) =>
   arr.sort((a, b) => b.id - a.id)
@@ -100,11 +115,15 @@ function clear() {
   )
   db.exec('DROP TABLE IF EXISTS User')
   db.exec(
-    "CREATE TABLE IF NOT EXISTS User('id' int PRIMARY KEY, 'name' varchar);"
+    "CREATE TABLE IF NOT EXISTS User('id' int PRIMARY KEY, 'name' varchar, 'meta' varchar);"
   )
   db.exec('DROP TABLE IF EXISTS Profile')
   db.exec(
-    "CREATE TABLE IF NOT EXISTS Profile('id' int PRIMARY KEY, 'bio' varchar, 'userId' int);"
+    "CREATE TABLE IF NOT EXISTS Profile('id' int PRIMARY KEY, 'bio' varchar, 'meta' json, 'userId' int, 'imageId' varchar);"
+  )
+  db.exec('DROP TABLE IF EXISTS ProfileImage')
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS ProfileImage('id' varchar PRIMARY KEY, 'image' blob);"
   )
 }
 
@@ -212,6 +231,7 @@ test.serial('create query with nested object for outgoing FK', async (t) => {
   t.deepEqual(relatedUser, {
     id: 1094,
     name: 'kevin',
+    meta: null,
   })
 
   clear()
@@ -242,6 +262,7 @@ test.serial('create query with nested objects for incoming FK', async (t) => {
   t.deepEqual(res, {
     id: 1094,
     name: 'kevin',
+    meta: null,
   })
 
   const relatedPost1 = await postTable.findUnique({
@@ -275,6 +296,28 @@ test.serial('create query with nested objects for incoming FK', async (t) => {
   clear()
 })
 
+test.serial('create query with nullable FK', async (t) => {
+  const res = await profileTable.create({
+    data: {
+      id: 1094,
+      bio: 'whatever',
+      userId: 1,
+      imageId: null,
+    },
+    include: { image: true },
+  })
+
+  t.deepEqual(res, {
+    id: 1094,
+    bio: 'whatever',
+    meta: null,
+    imageId: null,
+    userId: 1,
+  })
+
+  clear()
+})
+
 // Test that we can make a create query
 test.serial('create query', async (t) => {
   const res = await tbl.create({
@@ -285,6 +328,44 @@ test.serial('create query', async (t) => {
 
   clear()
 })
+
+test.serial(
+  'create query supports nested objects with same column names different types',
+  async (t) => {
+    const res = await profileTable.create({
+      data: {
+        id: 4012,
+        bio: 'test',
+        meta: { bar: 'test' },
+        user: {
+          create: {
+            id: 4013,
+            name: 'kevin',
+            meta: invalidJson,
+          },
+        },
+      },
+      include: {
+        user: true,
+      },
+    })
+
+    t.deepEqual(res, {
+      id: 4012,
+      bio: 'test',
+      meta: { bar: 'test' },
+      userId: 4013,
+      user: {
+        id: 4013,
+        name: 'kevin',
+        meta: invalidJson,
+      },
+      imageId: null,
+    })
+
+    clear()
+  }
+)
 
 test.serial('create query supports include argument', async (t) => {
   await userTable.createMany({
@@ -357,7 +438,7 @@ test.serial('findUnique query', async (t) => {
 })
 
 test.serial('raw query', async (t) => {
-  const res = await electricDb.raw({
+  const res = await electricDb.rawQuery({
     sql: 'SELECT * FROM Post WHERE id = ?',
     args: [post2.id],
   })
@@ -603,11 +684,9 @@ test.serial(
   'findMany can fetch related objects based on incoming FK of one-to-many relation',
   async (t) => {
     const res = await userTable.findMany({
-      where: {
-        id: 1,
-      },
       include: {
         posts: true,
+        profile: true,
       },
     })
 
@@ -615,6 +694,10 @@ test.serial(
       {
         ...author1,
         posts: [post1, post2],
+      },
+      {
+        ...author2,
+        posts: [post3],
       },
     ])
   }
@@ -1065,7 +1148,68 @@ async function populate() {
   await profileTable.createMany({
     data: [profile1, profile2],
   })
+
+  await imageTable.createMany({
+    data: [image1],
+  })
 }
+
+test.serial(
+  'findMany can handle related objects with fields of same name and different type',
+  async (t) => {
+    await populate()
+    const res = await profileTable.findMany({
+      where: { id: profile2.id },
+      include: { user: true },
+    })
+
+    t.deepEqual(res, [
+      {
+        ...profile2,
+        user: author2,
+      },
+    ])
+  }
+)
+
+test.serial('findMany can handle nullable foreign keys', async (t) => {
+  await populate()
+  const res = await profileTable.findMany({
+    include: { image: true },
+  })
+
+  t.deepEqual(res, [profile1, { ...profile2, image: image1 }])
+})
+
+test.serial(
+  'update query can handle related objects with fields of same name and different type',
+  async (t) => {
+    await populate()
+    const res = await profileTable.update({
+      where: { id: 2 },
+      data: {
+        meta: { bar: 3 },
+        user: {
+          update: {
+            meta: invalidJson,
+          },
+        },
+      },
+      include: {
+        user: true,
+      },
+    })
+
+    t.deepEqual(res, {
+      ...profile2,
+      meta: { bar: 3 },
+      user: {
+        ...author2,
+        meta: invalidJson,
+      },
+    })
+  }
+)
 
 test.serial(
   'update query can update related object for outgoing FK',

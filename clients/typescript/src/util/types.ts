@@ -1,6 +1,7 @@
 import type Long from 'long'
 import {
   SatOpMigrate_Column,
+  SatOpMigrate_PgColumnType,
   SatOpMigrate_Table,
   SatOpMigrate_Type,
   SatRelation_RelationType,
@@ -35,6 +36,7 @@ export class SatelliteError extends Error {
 }
 
 export enum SatelliteErrorCode {
+  CONNECTION_CANCELLED_BY_DISCONNECT,
   CONNECTION_FAILED_AFTER_RETRY,
   INTERNAL,
   TIMEOUT,
@@ -52,6 +54,7 @@ export enum SatelliteErrorCode {
   AUTH_ERROR,
   AUTH_FAILED,
   AUTH_REQUIRED,
+  AUTH_EXPIRED,
 
   // server errors
   INVALID_REQUEST,
@@ -77,11 +80,20 @@ export enum SatelliteErrorCode {
   REFERENTIAL_INTEGRITY_VIOLATION,
   EMPTY_SHAPE_DEFINITION,
   DUPLICATE_TABLE_IN_SHAPE_DEFINITION,
+  INVALID_WHERE_CLAUSE_IN_SHAPE_DEFINITION,
+  INVALID_INCLUDE_TREE_IN_SHAPE_DEFINITION,
 
   // shape data errors
   SHAPE_DELIVERY_ERROR,
   SHAPE_SIZE_LIMIT_EXCEEDED,
+
+  // replication transform errors
+  REPLICATION_TRANSFORM_ERROR,
 }
+
+export type SocketCloseReason =
+  | SatelliteErrorCode.AUTH_EXPIRED
+  | SatelliteErrorCode.SOCKET_ERROR
 
 export type AuthResponse = {
   serverId?: string
@@ -105,6 +117,16 @@ export type Transaction = {
   migrationVersion?: string // the Postgres version number if this is a migration
 }
 
+export type ServerTransaction = Transaction & {
+  id: Long
+  additionalDataRef?: Long
+}
+
+export interface AdditionalData {
+  ref: Long
+  changes: DataInsert[]
+}
+
 // A transaction whose changes are only DML statements
 // i.e. the transaction does not contain migrations
 export type DataTransaction = Omit<
@@ -118,6 +140,8 @@ export enum DataChangeType {
   INSERT = 'INSERT',
   UPDATE = 'UPDATE',
   DELETE = 'DELETE',
+  COMPENSATION = 'COMPENSATION',
+  GONE = 'GONE',
 }
 
 export type Change = DataChange | SchemaChange
@@ -130,9 +154,19 @@ export type DataChange = {
   tags: Tag[]
 }
 
-// The properties are omitted from columns because they are not currently used.
+export type DataInsert = {
+  relation: Relation
+  type: DataChangeType.INSERT
+  record: Record
+  tags: Tag[]
+}
+
+export type SatOpMigrate_Col = Omit<SatOpMigrate_Column, '$type' | 'pgType'> & {
+  pgType: Omit<SatOpMigrate_PgColumnType, '$type'> | undefined
+}
+
 export type MigrationTable = Omit<SatOpMigrate_Table, '$type' | 'columns'> & {
-  columns: Omit<SatOpMigrate_Column, '$type' | 'pgType'>[]
+  columns: SatOpMigrate_Col[]
 }
 
 export type SchemaChange = {
@@ -146,7 +180,9 @@ export function isDataChange(change: Change): change is DataChange {
   return 'relation' in change
 }
 
-export type Record = { [key: string]: string | number | undefined | null }
+export type Record = {
+  [key: string]: string | number | Uint8Array | undefined | null
+}
 
 export type Replication<TransactionType> = {
   authenticated: boolean
@@ -154,6 +190,22 @@ export type Replication<TransactionType> = {
   relations: Map<number, Relation>
   last_lsn: LSN | undefined
   transactions: TransactionType[]
+}
+
+export interface InboundReplication extends Replication<ServerTransaction> {
+  lastTxId: Long | undefined
+  lastAckedTxId: Long | undefined
+  unackedTxs: number
+  maxUnackedTxs: number
+  ackTimer: ReturnType<typeof setTimeout>
+  ackPeriod: number
+  additionalData: AdditionalData[]
+  unseenAdditionalDataRefs: Set<string>
+  incomplete?: 'transaction' | 'additionalData'
+  seenAdditionalDataSinceLastTx: {
+    subscriptions: string[]
+    dataRefs: Long[]
+  }
 }
 
 export type Relation = {
@@ -168,7 +220,7 @@ export type RelationColumn = {
   name: string
   type: string
   isNullable: boolean
-  primaryKey?: boolean
+  primaryKey?: number
 }
 
 export type RelationsCache = { [k: string]: Relation }
@@ -180,15 +232,29 @@ export enum ReplicationStatus {
   ACTIVE,
 }
 
+export type ReplicatedRowTransformer<RowType> = {
+  transformInbound: (row: Readonly<RowType>) => RowType
+  transformOutbound: (row: Readonly<RowType>) => RowType
+}
+
 export type ErrorCallback = (error: SatelliteError) => void
 export type RelationCallback = (relation: Relation) => void
+export type AdditionalDataCallback = (
+  data: AdditionalData
+) => void | Promise<void>
 export type TransactionCallback = (
-  transaction: DataTransaction
+  transaction: ServerTransaction
 ) => Promise<void>
 export type IncomingTransactionCallback = (
   transaction: DataTransaction,
   AckCb: () => void
 ) => void
-export type OutboundStartedCallback = (lsn: LSN) => void
+export type OutboundStartedCallback = () => void
 
-export type ConnectivityState = 'available' | 'connected' | 'disconnected'
+export type ConnectivityStatus = 'connected' | 'disconnected'
+export type ConnectivityState = {
+  status: ConnectivityStatus
+  reason?: SatelliteError // reason for `disconnected` status
+}
+
+export type Uuid = `${string}-${string}-${string}-${string}-${string}`

@@ -12,7 +12,7 @@ defmodule Electric.Satellite.WsValidationsTest do
   alias Electric.Satellite.Serialization
 
   @table_name "foo"
-  @receive_timeout 500
+  @receive_timeout 1000
 
   setup :setup_replicated_db
 
@@ -21,7 +21,7 @@ defmodule Electric.Satellite.WsValidationsTest do
 
     plug =
       {Electric.Plug.SatelliteWebsocketPlug,
-       auth_provider: Auth.provider(), pg_connector_opts: ctx.pg_connector_opts}
+       auth_provider: Auth.provider(), connector_config: ctx.connector_config}
 
     start_link_supervised!({Bandit, port: port, plug: plug})
 
@@ -98,7 +98,7 @@ defmodule Electric.Satellite.WsValidationsTest do
     valid_records = [
       %{"id" => "1", "b" => "t"},
       %{"id" => "2", "b" => "f"},
-      %{"id" => "3", "b" => ""}
+      %{"id" => "3", "b" => nil}
     ]
 
     within_replication_context(ctx, vsn, fn conn ->
@@ -107,7 +107,7 @@ defmodule Electric.Satellite.WsValidationsTest do
         MockClient.send_data(conn, tx_op_log)
       end)
 
-      refute_received {^conn, %SatErrorResp{error_type: :INVALID_REQUEST}}
+      refute_receive {^conn, %SatErrorResp{error_type: :INVALID_REQUEST}}, @receive_timeout
     end)
 
     invalid_records = [
@@ -137,17 +137,17 @@ defmodule Electric.Satellite.WsValidationsTest do
       migrate(
         ctx.db,
         vsn,
-        "CREATE TABLE public.foo (id TEXT PRIMARY KEY, i2_1 SMALLINT, i2_2 INT2, i4_1 INTEGER, i4_2 INT4)",
-        # "CREATE TABLE public.foo (id TEXT PRIMARY KEY, i2_1 SMALLINT, i2_2 INT2, i4_1 INTEGER, i4_2 INT4, i8_1 BIGINT, i8_2 INT8)"
+        "CREATE TABLE public.foo (id TEXT PRIMARY KEY, i2_1 SMALLINT, i2_2 INT2, i4_1 INTEGER, i4_2 INT4, i8_1 BIGINT, i8_2 INT8)",
         electrify: "public.foo"
       )
 
     valid_records = [
       %{"id" => "1", "i2_1" => "1", "i2_2" => "-1"},
-      %{"id" => "2", "i2_1" => "32767", "i2_2" => "-32768"},
+      %{"id" => "2", "i2_1" => "-32768", "i2_2" => "32767"},
       %{"id" => "3", "i4_1" => "+0", "i4_2" => "-0"},
-      %{"id" => "4", "i4_1" => "2147483647", "i4_2" => "-2147483648"}
-      # %{"id" => "5", "i8_1" => "-9223372036854775808", "i8_2" => "+9223372036854775807"}
+      %{"id" => "4", "i4_1" => "-2147483648", "i4_2" => "2147483647"},
+      %{"id" => "5", "i8_1" => "-30000000000", "i8_2" => "30000000000"},
+      %{"id" => "6", "i8_1" => "-9223372036854775808", "i8_2" => "+9223372036854775807"}
     ]
 
     within_replication_context(ctx, vsn, fn conn ->
@@ -164,13 +164,19 @@ defmodule Electric.Satellite.WsValidationsTest do
       %{"id" => "11", "i2_2" => "five"},
       %{"id" => "12", "i4_1" => "."},
       %{"id" => "13", "i4_2" => "-"},
-      # %{"id" => "14", "i8_1" => "+"},
-      # %{"id" => "15", "i8_2" => "0.0"},
-      # %{"id" => "16", "i8_1" => "1_000"},
+      %{"id" => "14", "i8_1" => "+"},
+      %{"id" => "15", "i8_2" => "0.0"},
+      %{"id" => "16", "i8_1" => "1_000"},
       %{"id" => "17", "i4_2" => "-1+5"},
       %{"id" => "18", "i4_1" => "0x33"},
       %{"id" => "19", "i2_2" => "0b101011"},
-      %{"id" => "20", "i2_1" => "0o373"}
+      %{"id" => "20", "i2_1" => "0o373"},
+      %{"id" => "21", "i2_1" => "-32769"},
+      %{"id" => "22", "i2_2" => "32768"},
+      %{"id" => "23", "i4_1" => "-2147483649"},
+      %{"id" => "24", "i4_2" => "2147483648"},
+      %{"id" => "25", "i8_1" => "-9223372036854775809"},
+      %{"id" => "26", "i8_2" => "9223372036854775808"}
     ]
 
     Enum.each(invalid_records, fn record ->
@@ -189,23 +195,27 @@ defmodule Electric.Satellite.WsValidationsTest do
       migrate(
         ctx.db,
         vsn,
-        "CREATE TABLE public.foo (id TEXT PRIMARY KEY, f8 DOUBLE PRECISION)",
+        "CREATE TABLE public.foo (id TEXT PRIMARY KEY, f4 REAL, f8 DOUBLE PRECISION)",
         electrify: "public.foo"
       )
 
     valid_records = [
-      %{"id" => "1", "f8" => "+0.0"},
-      %{"id" => "2", "f8" => "+0.1"},
-      %{"id" => "3", "f8" => "1"},
-      %{"id" => "4", "f8" => "-1"},
-      %{"id" => "5", "f8" => "7.3e-4"},
-      %{"id" => "6", "f8" => "1.23456789E+248"},
-      %{"id" => "7", "f8" => "-0.0"},
-      %{"id" => "8", "f8" => "-1.0"},
-      %{"id" => "9", "f8" => "1e-10"},
-      %{"id" => "10", "f8" => "+0"},
-      %{"id" => "11", "f8" => "-0"},
-      %{"id" => "12", "f8" => "0"}
+      %{"id" => "1", "f4" => "+0.0", "f8" => "+0.0"},
+      %{"id" => "2", "f4" => "+0.1", "f8" => "+0.1"},
+      %{"id" => "3", "f4" => "1", "f8" => "1"},
+      %{"id" => "4", "f4" => "-1", "f8" => "-1"},
+      %{"id" => "5", "f4" => "7.3e-4", "f8" => "7.3e-4"},
+      %{"id" => "6", "f4" => "3.4028234663852886e38", "f8" => "1.23456789E+248"},
+      %{"id" => "7", "f4" => "-0.0", "f8" => "-0.0"},
+      %{"id" => "8", "f4" => "-1.0", "f8" => "-1.0"},
+      %{"id" => "9", "f4" => "-1e-10", "f8" => "1e-10"},
+      %{"id" => "10", "f4" => "+0", "f8" => "+0"},
+      %{"id" => "11", "f4" => "-0", "f8" => "-0"},
+      %{"id" => "12", "f4" => "0", "f8" => "0"},
+      %{"id" => "13", "f4" => "-3.4028234663852886e38", "f8" => "-2.387561194739013e307"},
+      %{"id" => "14", "f4" => "inf", "f8" => "Infinity"},
+      %{"id" => "15", "f4" => "-INF", "f8" => "-iNfInItY"},
+      %{"id" => "16", "f4" => "nan", "f8" => "nAn"}
     ]
 
     within_replication_context(ctx, vsn, fn conn ->
@@ -228,7 +238,26 @@ defmodule Electric.Satellite.WsValidationsTest do
       %{"id" => "27", "f8" => "20_30"},
       %{"id" => "28", "f8" => "0x33"},
       %{"id" => "29", "f8" => "0b101011"},
-      %{"id" => "30", "f8" => "0o373"}
+      %{"id" => "30", "f8" => "0o373"},
+      %{"id" => "31", "f4" => "five"},
+      %{"id" => "32", "f4" => "."},
+      %{"id" => "33", "f4" => "-"},
+      %{"id" => "34", "f4" => "+"},
+      %{"id" => "35", "f4" => "0."},
+      %{"id" => "36", "f4" => " 1"},
+      %{"id" => "37", "f4" => "20_30"},
+      %{"id" => "38", "f4" => "0x33"},
+      %{"id" => "39", "f4" => "0b101011"},
+      %{"id" => "40", "f4" => "0o373"},
+      %{"id" => "41", "f4" => ""},
+      %{"id" => "42", "f4" => "1.23456789E+248"},
+      %{"id" => "43", "f4" => "-1.23456789e40"},
+      %{"id" => "44", "f4" => "0.6e-45"},
+      %{"id" => "45", "f8" => "1.8e+308"}
+      # The following number does not fit into a 64-bit float but there's no way to detect that in Elixir, short of
+      # writing our own custom parsing for this one edge case.
+      # Using the built-in string-to-float conversion, the number is parsed as `-0.0`.
+      # %{"id" => "46", "f8" => "-2.4e-324"}
     ]
 
     Enum.each(invalid_records, fn record ->
@@ -418,13 +447,137 @@ defmodule Electric.Satellite.WsValidationsTest do
     end)
   end
 
+  test "validates json values", ctx do
+    vsn = "2023110701"
+
+    :ok =
+      migrate(
+        ctx.db,
+        vsn,
+        "CREATE TABLE public.foo (id TEXT PRIMARY KEY, jb JSONB)",
+        electrify: "public.foo"
+      )
+
+    valid_records = [
+      %{"id" => "1", "jb" => "null"},
+      %{"id" => "2", "jb" => "{}"},
+      %{"id" => "3", "jb" => "[]"},
+      %{"id" => "4", "jb" => "\"hello\""},
+      %{"id" => "5", "jb" => "-123"},
+      %{"id" => "6", "jb" => ~s'{"foo": {"bar": ["baz", "quux"]}, "x": "I 👀 you"}'},
+      %{"id" => "7", "jb" => ~s'[1, 2.0, 3e5, true, false, null, "", ["It\'s \u26a1"]]'}
+    ]
+
+    within_replication_context(ctx, vsn, fn conn ->
+      Enum.each(valid_records, fn record ->
+        tx_op_log = serialize_trans(record)
+        MockClient.send_data(conn, tx_op_log)
+      end)
+
+      refute_receive {^conn, %SatErrorResp{error_type: :INVALID_REQUEST}}, @receive_timeout
+    end)
+
+    invalid_records = [
+      %{"id" => "10", "jb" => "now"},
+      %{"id" => "11", "jb" => ".123"},
+      %{"id" => "12", "jb" => ".."},
+      %{"id" => "13", "jb" => "{]"},
+      %{"id" => "13", "jb" => "[}"},
+      %{"id" => "14", "jb" => "\"hello"},
+      %{"id" => "15", "jb" => "+"},
+      %{"id" => "16", "jb" => "-"},
+      %{"id" => "16", "jb" => "0.0.0"}
+    ]
+
+    Enum.each(invalid_records, fn record ->
+      within_replication_context(ctx, vsn, fn conn ->
+        tx_op_log = serialize_trans(record)
+        MockClient.send_data(conn, tx_op_log)
+        assert_receive {^conn, %SatErrorResp{error_type: :INVALID_REQUEST}}, @receive_timeout
+      end)
+    end)
+  end
+
+  test "validates bytea values", ctx do
+    vsn = "2024032701"
+
+    :ok =
+      migrate(
+        ctx.db,
+        vsn,
+        "CREATE TABLE public.foo (id TEXT PRIMARY KEY, blob BYTEA)",
+        electrify: "public.foo"
+      )
+
+    valid_records = [
+      %{"id" => "1", "blob" => <<0, 5, 255, 13, 1, 23>>},
+      %{"id" => "2", "blob" => <<>>},
+      %{"id" => "3", "blob" => nil},
+      %{"id" => "4", "blob" => "any kind of text"},
+      %{"id" => "5", "blob" => "\\x0001ff"}
+    ]
+
+    within_replication_context(ctx, vsn, fn conn ->
+      Enum.each(valid_records, fn record ->
+        tx_op_log = serialize_trans(record)
+        MockClient.send_data(conn, tx_op_log)
+      end)
+
+      refute_receive {^conn, %SatErrorResp{error_type: :INVALID_REQUEST}}, @receive_timeout
+    end)
+  end
+
+  test "validates enum values", ctx do
+    vsn = "2023092001"
+
+    :ok =
+      migrate(
+        ctx.db,
+        vsn,
+        "CREATE TYPE public.coffee AS ENUM ('espresso', 'latte', 'Black_with_milk'); CREATE TABLE public.foo (id TEXT PRIMARY KEY, cup_of coffee)",
+        electrify: "public.foo"
+      )
+
+    valid_records = [
+      %{"id" => "1", "cup_of" => "espresso"},
+      %{"id" => "2", "cup_of" => "latte"},
+      %{"id" => "3", "cup_of" => "Black_with_milk"},
+      %{"id" => "4", "cup_of" => nil}
+    ]
+
+    within_replication_context(ctx, vsn, fn conn ->
+      Enum.each(valid_records, fn record ->
+        tx_op_log = serialize_trans(record)
+        MockClient.send_data(conn, tx_op_log)
+      end)
+
+      refute_receive {^conn, %SatErrorResp{error_type: :INVALID_REQUEST}}, @receive_timeout
+    end)
+
+    invalid_records = [
+      %{"id" => "10", "cup_of" => "e"},
+      %{"id" => "11", "cup_of" => "l"},
+      %{"id" => "12", "cup_of" => "(espresso)"},
+      %{"id" => "13", "cup_of" => "'latte'"},
+      %{"id" => "14", "cup_of" => "ESPRESSO"}
+    ]
+
+    Enum.each(invalid_records, fn record ->
+      within_replication_context(ctx, vsn, fn conn ->
+        tx_op_log = serialize_trans(record)
+        MockClient.send_data(conn, tx_op_log)
+        assert_receive {^conn, %SatErrorResp{error_type: :INVALID_REQUEST}}, @receive_timeout
+      end)
+    end)
+  end
+
   defp within_replication_context(ctx, vsn, expectation_fn) do
     with_connect(ctx.conn_opts, fn conn ->
       # Replication start ceremony
       start_replication_and_assert_response(conn, 0)
 
       # Confirm the server has sent the migration to the client
-      assert_receive {^conn, %SatRelation{table_name: @table_name} = relation}
+      assert_receive {^conn, %SatRelation{table_name: @table_name} = relation}, @receive_timeout
 
       assert_receive {^conn,
                       %SatOpLog{
@@ -433,7 +586,8 @@ defmodule Electric.Satellite.WsValidationsTest do
                           %SatTransOp{op: {:migrate, %{version: ^vsn}}},
                           %SatTransOp{op: {:commit, _}}
                         ]
-                      }}
+                      }},
+                     @receive_timeout
 
       # The client has to repeat the relation message to the server
       MockClient.send_data(conn, relation)

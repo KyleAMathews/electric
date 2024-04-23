@@ -71,6 +71,8 @@ defmodule Electric.Replication.Postgres.SlotServer do
           | {:preprocess_change_fn, preprocess_change_fn()}
           | {:preprocess_relation_list_fn, preprocess_relation_list_fn()}
 
+  @lsn_step 10
+
   # Public interface
 
   @spec start_link([opts(), ...]) :: GenServer.on_start()
@@ -313,10 +315,6 @@ defmodule Electric.Replication.Postgres.SlotServer do
   end
 
   defp send_transaction(tx, pos, state) do
-    Logger.debug(fn ->
-      "Will send #{length(tx.changes)} to subscriber: #{inspect(tx.changes, pretty: true)}"
-    end)
-
     {wal_messages, relations, new_lsn} = convert_to_wal(tx, state)
     send_all(wal_messages, state.send_fn, state.telemetry_span)
 
@@ -375,7 +373,7 @@ defmodule Electric.Replication.Postgres.SlotServer do
          %Changes.Transaction{commit_timestamp: ts, changes: changes, origin: origin},
          %State{} = state
        ) do
-    first_lsn = Lsn.increment(state.current_lsn)
+    first_lsn = Lsn.increment(state.current_lsn, @lsn_step)
 
     {internal_relations, user_relations} =
       changes
@@ -410,16 +408,23 @@ defmodule Electric.Replication.Postgres.SlotServer do
     {messages, final_lsn} =
       changes
       |> Enum.flat_map(&preprocess_changes(state, &1, relations, {ts, origin}))
-      |> tap(&Logger.debug("Messages after preprocessing: #{inspect(&1, pretty: true)}"))
+      |> tap(
+        &Logger.debug(fn ->
+          "Processed tx changes (# pre: #{length(changes)}, # post: #{length(&1)}): " <>
+            inspect(&1, pretty: true)
+        end)
+      )
       |> Enum.map(&changes_to_wal(&1, relations))
-      |> Enum.map_reduce(first_lsn, fn elem, lsn -> {{lsn, elem}, Lsn.increment(lsn)} end)
+      |> Enum.map_reduce(first_lsn, fn elem, lsn ->
+        {{lsn, elem}, Lsn.increment(lsn, @lsn_step)}
+      end)
 
     relation_messages =
       Enum.map(missing_relations, fn table_info ->
         {%Lsn{segment: 0, offset: 0}, relation_to_wal(table_info)}
       end)
 
-    commit_lsn = Lsn.increment(final_lsn)
+    commit_lsn = Lsn.increment(final_lsn, @lsn_step)
 
     begin = [
       {first_lsn,
@@ -458,10 +463,7 @@ defmodule Electric.Replication.Postgres.SlotServer do
     }
   end
 
-  defp changes_to_wal(
-         %Changes.UpdatedRecord{relation: table, old_record: nil, record: new},
-         relations
-       ) do
+  defp changes_to_wal(%Changes.Compensation{relation: table, record: new}, relations) do
     %ReplicationMessages.Update{
       relation_id: relations[table].oid,
       tuple_data: record_to_tuple(new, relations[table].columns)
@@ -511,7 +513,7 @@ defmodule Electric.Replication.Postgres.SlotServer do
     %ReplicationMessages.Relation.Column{
       flags: flags,
       name: column.name,
-      type: column.type,
+      type_oid: Electric.Postgres.OidDatabase.oid_for_name(column.type),
       type_modifier: column.type_modifier
     }
   end

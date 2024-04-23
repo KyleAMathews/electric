@@ -13,8 +13,18 @@ import { InvalidArgumentError } from '../validation/errors/invalidArgumentError'
 import * as z from 'zod'
 import { IShapeManager } from './shapes'
 import Log from 'loglevel'
+import { ExtendedTableSchema } from './schema'
+import { PgBasicType } from '../conversions/types'
+import { HKT } from '../util/hkt'
+import { isObject } from '../../util'
 
 const squelPostgres = squel.useFlavour('postgres')
+squelPostgres.registerValueHandler('bigint', function (bigint) {
+  return bigint.toString()
+})
+squelPostgres.registerValueHandler(Uint8Array, function (uint8) {
+  return uint8
+})
 
 type AnyFindInput = FindInput<any, any, any, any, any>
 
@@ -22,7 +32,19 @@ export class Builder {
   constructor(
     private _tableName: string,
     private _fields: string[],
-    private shapeManager: IShapeManager
+    private shapeManager: IShapeManager,
+    private _tableDescription: ExtendedTableSchema<
+      any,
+      any,
+      any,
+      any,
+      any,
+      any,
+      any,
+      any,
+      any,
+      HKT
+    >
   ) {}
 
   create(i: CreateInput<any, any, any>): QueryBuilder {
@@ -94,7 +116,7 @@ export class Builder {
   ): QueryBuilder {
     const unsupportedEntry = Object.entries(i.data).find((entry) => {
       const [_key, value] = entry
-      return typeof value === 'object' && value !== null
+      return isObject(value)
     })
     if (unsupportedEntry)
       throw new InvalidArgumentError(
@@ -196,8 +218,24 @@ export class Builder {
     const fields = identificationFields
       .filter((f) => this._fields.includes(f))
       .concat(selectedFields)
+      .map((f) => this.castBigIntToText(f))
 
     return q.fields(fields)
+  }
+
+  /**
+   * Casts a field to TEXT if it is of type BigInt
+   * because not all adapters deal well with BigInts
+   * (e.g. better-sqlite3 requires BigInt support to be enabled
+   *       but then all integers are returned as BigInt...)
+   * The DAL will convert the string into a BigInt in the `fromSqlite` function from `../conversions/sqlite.ts`.
+   */
+  private castBigIntToText(field: string) {
+    const pgType = this._tableDescription.fields.get(field)
+    if (pgType === PgBasicType.PG_INT8) {
+      return `cast(${field} as TEXT) AS ${field}`
+    }
+    return field
   }
 
   private addOrderBy(i: AnyFindInput, q: PostgresSelect): PostgresSelect {
@@ -243,6 +281,13 @@ export class Builder {
     query: T
   ): T {
     return this._fields.reduce((query, field) => {
+      // if field is of type BigInt cast the result to TEXT
+      // because not all adapters deal well with BigInts
+      // the DAL will convert the string into a BigInt in the `fromSqlite` function from `../conversions/sqlite.ts`.
+      const pgType = this._tableDescription.fields.get(field)
+      if (pgType === PgBasicType.PG_INT8) {
+        return query.returning(`cast(${field} as TEXT) AS ${field}`)
+      }
       return query.returning(field)
     }, query)
   }
@@ -264,22 +309,31 @@ function addFilters<T, Q extends QueryBuilder & WhereMixin>(
     const fieldValue = whereObject[fieldName as keyof T]
     const filters = makeFilter(fieldValue, fieldName)
     return filters.reduce((query, filter) => {
-      return query.where(filter.sql, ...(filter.args ?? []))
+      return query.where(filter.sql, ...(filter.args ?? [])) as Q
     }, query)
   }, q)
 }
 
-function makeFilter(
+export function makeFilter(
   fieldValue: unknown,
-  fieldName: string
+  fieldName: string,
+  prefixFieldsWith = ''
 ): Array<{ sql: string; args?: unknown[] }> {
-  if (fieldValue === null) return [{ sql: `${fieldName} IS NULL` }]
+  if (fieldValue === null)
+    return [{ sql: `${prefixFieldsWith}${fieldName} IS NULL` }]
   else if (fieldName === 'AND' || fieldName === 'OR' || fieldName === 'NOT') {
-    return [makeBooleanFilter(fieldName as 'AND' | 'OR' | 'NOT', fieldValue)]
-  } else if (typeof fieldValue === 'object') {
+    return [
+      makeBooleanFilter(
+        fieldName as 'AND' | 'OR' | 'NOT',
+        fieldValue,
+        prefixFieldsWith
+      ),
+    ]
+  } else if (isObject(fieldValue)) {
     // an object containing filters is provided
     // e.g. users.findMany({ where: { id: { in: [1, 2, 3] } } })
     const fs = {
+      equals: z.any(),
       in: z.any().array().optional(),
       not: z.any().optional(),
       notIn: z.any().optional(),
@@ -293,6 +347,7 @@ function makeFilter(
     }
 
     const fsHandlers = {
+      equals: makeEqualsFilter.bind(null),
       in: makeInFilter.bind(null),
       not: makeNotFilter.bind(null),
       notIn: makeNotInFilter.bind(null),
@@ -321,7 +376,10 @@ function makeFilter(
     Object.entries(fsHandlers).forEach((entry) => {
       const [filter, handler] = entry
       if (filter in obj) {
-        const sql = handler(fieldName, obj[filter as keyof typeof obj])
+        const sql = handler(
+          prefixFieldsWith + fieldName,
+          obj[filter as keyof typeof obj]
+        )
         filters.push(sql)
       }
     })
@@ -329,7 +387,8 @@ function makeFilter(
     return filters
   }
   // needed because `WHERE field = NULL` is not valid SQL
-  else return [{ sql: `${fieldName} = ?`, args: [fieldValue] }]
+  else
+    return [{ sql: `${prefixFieldsWith}${fieldName} = ?`, args: [fieldValue] }]
 }
 
 function joinStatements(
@@ -345,7 +404,8 @@ function joinStatements(
 
 function makeBooleanFilter(
   fieldName: 'AND' | 'OR' | 'NOT',
-  value: unknown
+  value: unknown,
+  prefixFieldsWith: string
 ): { sql: string; args?: unknown[] } {
   const objects = Array.isArray(value) ? value : [value] // the value may be a single object or an array of objects connected by the provided connective (AND, OR, NOT)
   const sqlStmts = objects.map((obj) => {
@@ -356,7 +416,7 @@ function makeBooleanFilter(
     const stmts = fields.reduce(
       (stmts: Array<{ sql: string; args?: unknown[] }>, fieldName) => {
         const fieldValue = obj[fieldName as keyof typeof obj]
-        const stmts2 = makeFilter(fieldValue, fieldName)
+        const stmts2 = makeFilter(fieldValue, fieldName, prefixFieldsWith)
         return stmts.concat(stmts2)
       },
       []
@@ -378,6 +438,13 @@ function makeBooleanFilter(
     // Join all filters in `sqlStmts` using the requested connective (which is 'OR' or 'NOT')
     return joinStatements(sqlStmts, fieldName)
   }
+}
+
+function makeEqualsFilter(
+  fieldName: string,
+  value: unknown | undefined
+): { sql: string; args?: unknown[] } {
+  return { sql: `${fieldName} = ?`, args: [value] }
 }
 
 function makeInFilter(
@@ -438,21 +505,31 @@ function makeStartsWithFilter(
   fieldName: string,
   value: unknown
 ): { sql: string; args?: unknown[] } {
-  return { sql: `${fieldName} LIKE ?`, args: [`${value}%`] }
+  if (typeof value !== 'string')
+    throw new Error('startsWith filter must be a string')
+  return { sql: `${fieldName} LIKE ?`, args: [`${escapeLike(value)}%`] }
 }
 
 function makeEndsWithFilter(
   fieldName: string,
   value: unknown
 ): { sql: string; args?: unknown[] } {
-  return { sql: `${fieldName} LIKE ?`, args: [`%${value}`] }
+  if (typeof value !== 'string')
+    throw new Error('endsWith filter must be a string')
+  return { sql: `${fieldName} LIKE ?`, args: [`%${escapeLike(value)}`] }
 }
 
 function makeContainsFilter(
   fieldName: string,
   value: unknown
 ): { sql: string; args?: unknown[] } {
-  return { sql: `${fieldName} LIKE ?`, args: [`%${value}%`] }
+  if (typeof value !== 'string')
+    throw new Error('contains filter must be a string')
+  return { sql: `${fieldName} LIKE ?`, args: [`%${escapeLike(value)}%`] }
+}
+
+function escapeLike(value: string): string {
+  return value.replaceAll(/(%|_)/g, '\\$1')
 }
 
 function addOffset(i: AnyFindInput, q: PostgresSelect): PostgresSelect {

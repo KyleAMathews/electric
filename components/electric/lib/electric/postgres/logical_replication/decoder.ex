@@ -18,7 +18,6 @@ defmodule Electric.Postgres.LogicalReplication.Decoder do
     Unsupported
   }
 
-  alias Electric.Postgres.OidDatabase
   alias Electric.Postgres.Lsn
 
   @doc """
@@ -38,8 +37,8 @@ defmodule Electric.Postgres.LogicalReplication.Decoder do
       iex> decode(<<82, 0, 0, 64, 12, 112, 117, 98, 108, 105, 99, 0, 101, 110, 116, 114, 105, 101, 115, 0, 102, 0, 2, 1, 105, 100, 0, 0, 0, 11, 134, 255, 255, 255, 255, 1, 99, 111, 110, 116, 101, 110, 116, 0, 0, 0, 4, 19, 0, 0, 0, 68>>)
       %#{Relation}{
         columns: [
-          %#{Column}{flags: [:key], name: "id", type: :uuid, type_modifier: -1},
-          %#{Column}{flags: [:key], name: "content", type: :varchar, type_modifier: 68}
+          %#{Column}{flags: [:key], name: "id", type_oid: 2950, type_modifier: -1},
+          %#{Column}{flags: [:key], name: "content", type_oid: 1043, type_modifier: 68}
         ],
         id: 16396,
         name: "entries",
@@ -210,7 +209,8 @@ defmodule Electric.Postgres.LogicalReplication.Decoder do
 
   defp decode_message_impl(<<"Y", data_type_id::integer-32, namespace_and_name::binary>>) do
     [namespace, name_with_null] = :binary.split(namespace_and_name, <<0>>)
-    name = String.slice(name_with_null, 0..-2)
+    # drop the last character
+    name = String.slice(name_with_null, 0..-2//1)
 
     %Type{
       id: data_type_id,
@@ -251,7 +251,7 @@ defmodule Electric.Postgres.LogicalReplication.Decoder do
   defp decode_columns(<<>>, accumulator), do: Enum.reverse(accumulator)
 
   defp decode_columns(<<flags::integer-8, rest::binary>>, accumulator) do
-    [name | [<<data_type_id::integer-32, type_modifier::signed-integer-32, columns::binary>>]] =
+    [name | [<<type_oid::integer-32, type_modifier::signed-integer-32, columns::binary>>]] =
       String.split(rest, <<0>>, parts: 2)
 
     decoded_flags =
@@ -264,7 +264,7 @@ defmodule Electric.Postgres.LogicalReplication.Decoder do
       %Column{
         name: name,
         flags: decoded_flags,
-        type: OidDatabase.name_for_oid(data_type_id),
+        type_oid: type_oid,
         type_modifier: type_modifier
       }
       | accumulator
@@ -275,6 +275,5 @@ defmodule Electric.Postgres.LogicalReplication.Decoder do
     DateTime.add(@pg_epoch, microsecond_offset, :microsecond)
   end
 
-  defp decode_lsn(<<segment::integer-32, offset::integer-32>>),
-    do: %Lsn{segment: segment, offset: offset}
+  defp decode_lsn(bin), do: Lsn.decode_bin(bin)
 end
