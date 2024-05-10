@@ -8,6 +8,8 @@ import { DatabaseAdapter } from '../../electric/adapter'
 import { GlobalRegistry, Registry, Satellite } from '../../satellite'
 import { ShapeManager } from './shapes'
 import { ReplicationTransformManager } from './transforms'
+import api from '@opentelemetry/api'
+export const tracer = api.trace.getTracer(`electric-client`)
 
 export type ClientTables<DB extends DbSchema<any>> = {
   [Tbl in keyof DB['tables']]: DB['tables'][Tbl] extends TableSchema<
@@ -112,13 +114,15 @@ export class ElectricClient<
    *                in which case the last seen token is reused.
    */
   async connect(token?: string): Promise<void> {
+    const connectSpan = tracer.startSpan(`electric.connect`)
     if (token === undefined && !this.satellite.hasToken()) {
       throw new Error('A token is required the first time you connect.')
     }
     if (token !== undefined) {
       this.satellite.setToken(token)
     }
-    await this.satellite.connectWithBackoff()
+    await this.satellite.connectWithBackoff(connectSpan)
+    connectSpan.end()
   }
 
   disconnect(): void {

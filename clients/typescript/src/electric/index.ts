@@ -5,10 +5,14 @@ import { EventNotifier, Notifier } from '../notifiers/index'
 import { globalRegistry, Registry } from '../satellite/index'
 import { SocketFactory } from '../sockets/index'
 import { DbName } from '../util/types'
+import { tracer } from '../util/tracer'
 import { setLogLevel } from '../util/debug'
 import { ElectricNamespace } from './namespace'
 import { ElectricClient } from '../client/model/client'
 import { DbSchema } from '../client/model/schema'
+
+import api from '@opentelemetry/api'
+export const tracer = api.trace.getTracer(`electric-client`)
 
 export { ElectricNamespace }
 export type * from './adapter'
@@ -50,9 +54,16 @@ export const electrify = async <DB extends DbSchema<any>>(
   config: ElectricConfig = {},
   opts?: Omit<ElectrifyOptions, 'adapter' | 'socketFactory'>
 ): Promise<ElectricClient<DB>> => {
+  const constructorSpan = tracer.startSpan(`electric.constructor`)
   setLogLevel(config.debug ? 'TRACE' : 'WARN')
   const prepare = opts?.prepare ?? defaultPrepare
+  const prepareSpan = tracer.startSpan(
+    'electric.constructor.prepareSpan',
+    undefined,
+    api.trace.setSpan(api.context.active(), constructorSpan)
+  )
   await prepare(adapter)
+  prepareSpan.end()
 
   const configWithDefaults = hydrateConfig(config)
   const migrator =
@@ -60,6 +71,11 @@ export const electrify = async <DB extends DbSchema<any>>(
   const notifier = opts?.notifier || new EventNotifier(dbName)
   const registry = opts?.registry || globalRegistry
 
+  const ensureStartedSpan = tracer.startSpan(
+    'electric.constructor.ensureStarted',
+    undefined,
+    api.trace.setSpan(api.context.active(), constructorSpan)
+  )
   const satellite = await registry.ensureStarted(
     dbName,
     dbDescription,
@@ -67,8 +83,10 @@ export const electrify = async <DB extends DbSchema<any>>(
     migrator,
     notifier,
     socketFactory,
-    configWithDefaults
+    configWithDefaults,
+    ensureStartedSpan,
   )
+  ensureStartedSpan.end()
 
   const electric = ElectricClient.create(
     dbName,
@@ -82,6 +100,7 @@ export const electrify = async <DB extends DbSchema<any>>(
   if (satellite.connectivityState !== undefined) {
     electric.setIsConnected(satellite.connectivityState)
   }
+  constructorSpan.end()
 
   return electric
 }

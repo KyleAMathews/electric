@@ -3,6 +3,9 @@ import { DatabaseAdapter } from '../electric/adapter'
 import { Migrator } from '../migrators/index'
 import { Notifier } from '../notifiers/index'
 import { DbName } from '../util/types'
+import api from '@opentelemetry/api'
+
+export const tracer = api.trace.getTracer(`electric-client`)
 
 import { Satellite, Registry } from './index'
 import {
@@ -54,7 +57,8 @@ export abstract class BaseRegistry implements Registry {
     notifier: Notifier,
     socketFactory: SocketFactory,
     config: InternalElectricConfig,
-    opts?: SatelliteOverrides
+    parentSpan: api.Span,
+    opts?: SatelliteOverrides,
   ): Promise<Satellite> {
     // If we're in the process of stopping the satellite process for this
     // dbName, then we wait for the process to be stopped and then we
@@ -71,7 +75,8 @@ export abstract class BaseRegistry implements Registry {
           notifier,
           socketFactory,
           config,
-          opts
+          parentSpan,
+          opts,
         )
       )
     }
@@ -97,7 +102,13 @@ export abstract class BaseRegistry implements Registry {
       return satellite
     }
 
+    console.log({ parentSpan })
     // Otherwise we need to fire it up!
+    const startProcessSpan = tracer.startSpan(
+      'satellite.registry.startProcess',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     const startingPromise = this.startProcess(
       dbName,
       dbDescription,
@@ -105,11 +116,13 @@ export abstract class BaseRegistry implements Registry {
       migrator,
       notifier,
       socketFactory,
-      config
+      config,
+      startProcessSpan,
     )
       .then((satellite) => {
         satellites[dbName] = satellite
 
+        startProcessSpan.end()
         return satellite
       })
       .finally(() => {
@@ -196,7 +209,8 @@ export class GlobalRegistry extends BaseRegistry {
     migrator: Migrator,
     notifier: Notifier,
     socketFactory: SocketFactory,
-    config: HydratedConfig
+    config: HydratedConfig,
+    parentSpan: api.Span
   ): Promise<Satellite> {
     const foundErrors = validateConfig(config)
     if (foundErrors.length > 0) {
@@ -230,7 +244,7 @@ export class GlobalRegistry extends BaseRegistry {
       client,
       satelliteOpts
     )
-    await satellite.start(config.auth)
+    await satellite.start(config.auth, parentSpan)
 
     return satellite
   }

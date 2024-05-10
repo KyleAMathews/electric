@@ -1,5 +1,8 @@
 import throttle from 'lodash.throttle'
 import uniqWith from 'lodash.uniqwith'
+import api from '@opentelemetry/api'
+
+export const tracer = api.trace.getTracer(`electric-client`)
 
 import {
   SatOpMigrate_Type,
@@ -210,23 +213,47 @@ export class SatelliteProcess implements Satellite {
     }
   }
 
-  async start(authConfig?: AuthConfig): Promise<void> {
+  async start(authConfig?: AuthConfig, parentSpan): Promise<void> {
+    const logSQLiteVersionSpan = tracer.startSpan(
+      'satellite.process.logSQLiteVersion',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     if (this.opts.debug) {
       await this.logSQLiteVersion()
     }
+    logSQLiteVersionSpan.end()
 
+    const migratorUpSpan = tracer.startSpan(
+      'satellite.process.migrator.up',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     await this.migrator.up()
+    migratorUpSpan.end()
 
+    const verifyTableStructureSpan = tracer.startSpan(
+      'satellite.process.verifyTableStructure',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     const isVerified = await this._verifyTableStructure()
     if (!isVerified) {
       throw new Error('Invalid database schema.')
     }
+    verifyTableStructureSpan.end()
 
+    const getClientIdSpan = tracer.startSpan(
+      'satellite.process.getClientId',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     const clientId =
       authConfig?.clientId && authConfig.clientId !== ''
         ? authConfig.clientId
         : await this._getClientId()
     this._setAuthState({ clientId: clientId })
+    getClientIdSpan.end()
 
     const notifierSubscriptions = Object.entries({
       _authStateSubscription: this._unsubscribeFromAuthState,
@@ -259,14 +286,32 @@ export class SatelliteProcess implements Satellite {
       this.opts.pollingInterval
     )
 
+    const throttledSnapshotSpan = tracer.startSpan(
+      'satellite.process.throttledSnapshot',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     // Starting now!
     await this._throttledSnapshot()
+    throttledSnapshotSpan.end()
 
     // Need to reload primary keys after schema migration
+    const getLocalRelationsSpan = tracer.startSpan(
+      'satellite.process.getLocalRelations',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     this.relations = await this._getLocalRelations()
+    getLocalRelationsSpan.end()
     this.checkMaxSqlParameters()
 
+    const getMetaLSNSpan = tracer.startSpan(
+      'satellite.process.getMetaLSN',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     const lsnBase64 = await this._getMeta('lsn')
+    getMetaLSNSpan.end()
     if (lsnBase64 && lsnBase64.length > 0) {
       this._lsn = base64.toBytes(lsnBase64)
       Log.info(`retrieved lsn ${this._lsn}`)
@@ -274,7 +319,13 @@ export class SatelliteProcess implements Satellite {
       Log.info(`no lsn retrieved from store`)
     }
 
+    const getMetaSubscriptionsSpan = tracer.startSpan(
+      'satellite.process.getMetaSubscriptions',
+      undefined,
+      api.trace.setSpan(api.context.active(), parentSpan)
+    )
     const subscriptionsState = await this._getMeta('subscriptions')
+    getMetaSubscriptionsSpan.end()
     if (subscriptionsState) {
       this.subscriptions.setState(subscriptionsState)
     }
@@ -379,6 +430,7 @@ export class SatelliteProcess implements Satellite {
     // First, we want to check if we already have either fulfilled or fulfilling subscriptions with exactly the same definitions
     const existingSubscription =
       this.subscriptions.getDuplicatingSubscription(shapeDefinitions)
+    console.log({existingSubscription})
     if (existingSubscription !== null && 'inFlight' in existingSubscription) {
       return {
         synced:
@@ -425,6 +477,7 @@ export class SatelliteProcess implements Satellite {
     try {
       const { subscriptionId, error }: SubscribeResponse =
         await this.client.subscribe(subId, shapeReqs)
+
       if (subId !== subscriptionId) {
         clearSubAndThrow(
           new Error(
@@ -743,7 +796,7 @@ export class SatelliteProcess implements Satellite {
     return this._authState?.token !== undefined
   }
 
-  async connectWithBackoff(): Promise<void> {
+  async connectWithBackoff(parentSpan): Promise<void> {
     if (this.client.isConnected()) {
       // we're already connected
       return
@@ -770,8 +823,22 @@ export class SatelliteProcess implements Satellite {
       if (this.initializing?.finished()) {
         return prom
       }
+
+      const connectSpan = tracer.startSpan(
+        'electric.connectWithBackoff.connect',
+        undefined,
+        api.trace.setSpan(api.context.active(), parentSpan)
+      )
       await this._connect()
+      connectSpan.end()
+
+      const startReplicationSpan = tracer.startSpan(
+        'electric.connectWithBackoff.startReplication',
+        undefined,
+        api.trace.setSpan(api.context.active(), parentSpan)
+      )
       await this._startReplication()
+      startReplicationSpan.end()
       this._subscribePreviousShapeRequests()
 
       this._notifyConnectivityState('connected')

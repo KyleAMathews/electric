@@ -57,6 +57,9 @@ import {
   transformTableRecord,
 } from './transforms'
 
+import api from '@opentelemetry/api'
+export const tracer = api.trace.getTracer(`electric-client`)
+
 type AnyTable = Table<any, any, any, any, any, any, any, any, any, HKT>
 
 export class Table<
@@ -253,7 +256,21 @@ export class Table<
   sync<T extends SyncInput<Include, Where>>(i?: T): Promise<ShapeSubscription> {
     const validatedInput = this.syncSchema.parse(i ?? {})
     const shape = this.computeShape(validatedInput)
-    return this._shapeManager.sync(shape)
+    console.log(`sync`, { validatedInput })
+    const attributes = {}
+    if (validatedInput.include) {
+      Object.entries(validatedInput.include).forEach(([k, v]) => {
+        attributes[`include.${k}`] = v
+      })
+    }
+    if (validatedInput.where) {
+      Object.entries(validatedInput.where).forEach(([k, v]) => {
+        attributes[`where.${k}`] = v
+      })
+    }
+    console.log({ attributes })
+    const syncSpan = tracer.startSpan(`table.sync`, { attributes })
+    return this._shapeManager.sync(shape, syncSpan)
   }
 
   /*
@@ -1650,7 +1667,13 @@ export function unsafeExec(
   adapter: DatabaseAdapter,
   sql: Statement
 ): Promise<Row[]> {
-  return adapter.query(sql)
+  console.log({ sql })
+
+  const sqlSpan = tracer.startSpan(`db.unsafeExec`, { attributes: { sql: sql.sql, args: JSON.stringify(sql.args) } })
+  return adapter.query(sql).then((res) => {
+    sqlSpan.end()
+    return res
+  })
 }
 
 export function rawQuery(
