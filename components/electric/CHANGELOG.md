@@ -1,5 +1,11 @@
 # @core/electric
 
+## 0.11.1
+
+### Patch Changes
+
+- 6a746d97: Correct handling of multi-statement migration sql
+
 ## 0.11.0
 
 ### Minor Changes
